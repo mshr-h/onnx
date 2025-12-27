@@ -30,6 +30,7 @@ from onnx import (
     numpy_helper,
 )
 from onnx.defs import (
+    AI_ONNX_PREVIEW_DOMAIN,
     AI_ONNX_PREVIEW_TRAINING_DOMAIN,
     ONNX_DOMAIN,
     ONNX_ML_DOMAIN,
@@ -7210,6 +7211,213 @@ class TestShapeInference(TestShapeInferenceHelper):
                 make_opsetid(ONNX_DOMAIN, 12),
             ],
         )
+
+    def _make_flex_mod_graph(
+        self,
+        name: str,
+        elem_type: int,
+        num_mod_inputs: int,
+        include_score_input: bool,
+        output_type: int,
+    ) -> GraphProto:
+        inputs: list[ValueInfoProto] = []
+        if include_score_input:
+            inputs.append(make_tensor_value_info("score_or_prob", elem_type, ()))
+        inputs.extend(
+            [
+                make_tensor_value_info("batch", TensorProto.INT64, ()),
+                make_tensor_value_info("head", TensorProto.INT64, ()),
+                make_tensor_value_info("q_idx", TensorProto.INT64, ()),
+                make_tensor_value_info("kv_idx", TensorProto.INT64, ()),
+            ]
+        )
+        for i in range(num_mod_inputs):
+            inputs.append(make_tensor_value_info(f"mod{i}", elem_type, ()))
+        outputs = [make_tensor_value_info(f"{name}_out", output_type, ())]
+        return helper.make_graph(
+            [make_node("Identity", [inputs[0].name if include_score_input else "batch"], [outputs[0].name])],
+            f"{name}_graph",
+            inputs,
+            outputs,
+        )
+
+    def test_flexattention_basic_shape_and_graph_attrs(self) -> None:
+        score_mod = self._make_flex_mod_graph(
+            "score_mod", TensorProto.FLOAT, num_mod_inputs=1, include_score_input=True, output_type=TensorProto.FLOAT
+        )
+        mask_mod_inputs = [
+            make_tensor_value_info("batch", TensorProto.INT64, ()),
+            make_tensor_value_info("head", TensorProto.INT64, ()),
+            make_tensor_value_info("q_idx", TensorProto.INT64, ()),
+            make_tensor_value_info("kv_idx", TensorProto.INT64, ()),
+            make_tensor_value_info("mod0", TensorProto.FLOAT, ()),
+        ]
+        mask_mod = helper.make_graph(
+            [make_node("Identity", ["batch"], ["mask_out"])],
+            "mask_mod_graph",
+            mask_mod_inputs,
+            [make_tensor_value_info("mask_out", TensorProto.BOOL, ())],
+        )
+        prob_mod = self._make_flex_mod_graph(
+            "prob_mod", TensorProto.FLOAT, num_mod_inputs=1, include_score_input=True, output_type=TensorProto.FLOAT
+        )
+
+        graph = self._make_graph(
+            [
+                ("Q", TensorProto.FLOAT, (2, 4, 8, 16)),
+                ("K", TensorProto.FLOAT, (2, 4, 8, 16)),
+                ("V", TensorProto.FLOAT, (2, 4, 8, 32)),
+                ("mod0", TensorProto.FLOAT, (1,)),
+            ],
+            [
+                make_node(
+                    "FlexAttention",
+                    ["Q", "K", "V", "mod0"],
+                    ["Y"],
+                    domain=AI_ONNX_PREVIEW_DOMAIN,
+                    enable_gqa=0,
+                    score_mod=score_mod,
+                    mask_mod=mask_mod,
+                    prob_mod=prob_mod,
+                )
+            ],
+            [make_tensor_value_info("Y", TensorProto.FLOAT, (None, None, None, None))],
+        )
+
+        self._assert_inferred(
+            graph,
+            [make_tensor_value_info("Y", TensorProto.FLOAT, (2, 4, 8, 32))],
+            opset_imports=[
+                make_opsetid(ONNX_DOMAIN, 26),
+                make_opsetid(AI_ONNX_PREVIEW_DOMAIN, 1),
+            ],
+        )
+
+    def test_flexattention_gqa_invalid(self) -> None:
+        graph = self._make_graph(
+            [
+                ("Q", TensorProto.FLOAT, (1, 3, 2, 4)),
+                ("K", TensorProto.FLOAT, (1, 2, 2, 4)),
+                ("V", TensorProto.FLOAT, (1, 2, 2, 4)),
+            ],
+            [
+                make_node(
+                    "FlexAttention",
+                    ["Q", "K", "V"],
+                    ["Y"],
+                    domain=AI_ONNX_PREVIEW_DOMAIN,
+                    enable_gqa=1,
+                )
+            ],
+            [make_tensor_value_info("Y", TensorProto.FLOAT, (None, None, None, None))],
+        )
+
+        with self.assertRaises(onnx.shape_inference.InferenceError):
+            self._inferred(
+                graph,
+                opset_imports=[
+                    make_opsetid(ONNX_DOMAIN, 26),
+                    make_opsetid(AI_ONNX_PREVIEW_DOMAIN, 1),
+                ],
+            )
+
+    def test_flexattention_head_mismatch(self) -> None:
+        graph = self._make_graph(
+            [
+                ("Q", TensorProto.FLOAT, (1, 2, 2, 4)),
+                ("K", TensorProto.FLOAT, (1, 3, 2, 4)),
+                ("V", TensorProto.FLOAT, (1, 3, 2, 4)),
+            ],
+            [
+                make_node(
+                    "FlexAttention",
+                    ["Q", "K", "V"],
+                    ["Y"],
+                    domain=AI_ONNX_PREVIEW_DOMAIN,
+                )
+            ],
+            [make_tensor_value_info("Y", TensorProto.FLOAT, (None, None, None, None))],
+        )
+
+        with self.assertRaises(onnx.shape_inference.InferenceError):
+            self._inferred(
+                graph,
+                opset_imports=[
+                    make_opsetid(ONNX_DOMAIN, 26),
+                    make_opsetid(AI_ONNX_PREVIEW_DOMAIN, 1),
+                ],
+            )
+
+    def test_flexattention_bad_mask_mod_output_type(self) -> None:
+        mask_mod = helper.make_graph(
+            [make_node("Identity", ["batch"], ["mask_out"])],
+            "mask_mod_graph",
+            [
+                make_tensor_value_info("batch", TensorProto.INT64, ()),
+                make_tensor_value_info("head", TensorProto.INT64, ()),
+                make_tensor_value_info("q_idx", TensorProto.INT64, ()),
+                make_tensor_value_info("kv_idx", TensorProto.INT64, ()),
+            ],
+            [make_tensor_value_info("mask_out", TensorProto.FLOAT, ())],
+        )
+        graph = self._make_graph(
+            [
+                ("Q", TensorProto.FLOAT, (1, 2, 2, 4)),
+                ("K", TensorProto.FLOAT, (1, 2, 2, 4)),
+                ("V", TensorProto.FLOAT, (1, 2, 2, 4)),
+            ],
+            [
+                make_node(
+                    "FlexAttention",
+                    ["Q", "K", "V"],
+                    ["Y"],
+                    domain=AI_ONNX_PREVIEW_DOMAIN,
+                    mask_mod=mask_mod,
+                )
+            ],
+            [make_tensor_value_info("Y", TensorProto.FLOAT, (None, None, None, None))],
+        )
+
+        with self.assertRaises(onnx.shape_inference.InferenceError):
+            self._inferred(
+                graph,
+                opset_imports=[
+                    make_opsetid(ONNX_DOMAIN, 26),
+                    make_opsetid(AI_ONNX_PREVIEW_DOMAIN, 1),
+                ],
+            )
+
+    def test_flexattention_score_mod_input_count_mismatch(self) -> None:
+        score_mod = self._make_flex_mod_graph(
+            "score_mod", TensorProto.FLOAT, num_mod_inputs=0, include_score_input=True, output_type=TensorProto.FLOAT
+        )
+        graph = self._make_graph(
+            [
+                ("Q", TensorProto.FLOAT, (1, 2, 2, 4)),
+                ("K", TensorProto.FLOAT, (1, 2, 2, 4)),
+                ("V", TensorProto.FLOAT, (1, 2, 2, 4)),
+                ("mod0", TensorProto.FLOAT, ()),
+            ],
+            [
+                make_node(
+                    "FlexAttention",
+                    ["Q", "K", "V", "mod0"],
+                    ["Y"],
+                    domain=AI_ONNX_PREVIEW_DOMAIN,
+                    score_mod=score_mod,
+                )
+            ],
+            [make_tensor_value_info("Y", TensorProto.FLOAT, (None, None, None, None))],
+        )
+
+        with self.assertRaises(onnx.shape_inference.InferenceError):
+            self._inferred(
+                graph,
+                opset_imports=[
+                    make_opsetid(ONNX_DOMAIN, 26),
+                    make_opsetid(AI_ONNX_PREVIEW_DOMAIN, 1),
+                ],
+            )
 
     def test_pad_opset10(self) -> None:
         graph = self._make_graph(
