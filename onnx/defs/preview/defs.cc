@@ -16,19 +16,17 @@ at up to three stages:
   (1) score_mod: modify each scalar attention score after Q·K^T
   (2) mask_mod : determine which (q_idx, kv_idx) connections are allowed
   (3) prob_mod : modify each scalar probability after Softmax
-This mirrors PyTorch's torch.nn.attention.flex_attention behavior.  (PyTorch is
-prototype; ONNX uses preview domain for incubation.)
 
 Inputs
 ------
 1) query (Q) : T
-   Query tensor. Shape: (B, Hq, L, E)
+   Query tensor. Shape: (B, Hq, L, E) or (B, L, E) for single-head inputs.
 
 2) key (K) : T
-   Key tensor. Shape: (B, Hkv, S, E)
+   Key tensor. Shape: (B, Hkv, S, E) or (B, S, E) for single-head inputs.
 
 3) value (V) : T
-   Value tensor. Shape: (B, Hkv, S, Ev)
+   Value tensor. Shape: (B, Hkv, S, Ev) or (B, S, Ev) for single-head inputs.
 
 4) mod_inputs (optional, variadic) : TMod...
    Extra tensors forwarded to score_mod/mask_mod/prob_mod graphs, enabling
@@ -39,7 +37,7 @@ Inputs
 Outputs
 -------
 1) output (Y) : T
-   Attention output. Shape: (B, Hq, L, Ev)
+   Attention output. Shape: (B, Hq, L, Ev) for 4D inputs or (B, L, Ev) for 3D inputs.
 
 Attributes
 ----------
@@ -117,9 +115,9 @@ TMod :
 Shape Constraints & Semantics
 -----------------------------
 Let:
-  Q: (B, Hq, L, E)
-  K: (B, Hkv, S, E)
-  V: (B, Hkv, S, Ev)
+  Q: (B, Hq, L, E) or (B, L, E)
+  K: (B, Hkv, S, E) or (B, S, E)
+  V: (B, Hkv, S, Ev) or (B, S, Ev)
 
 Head mapping:
   if enable_gqa == 0: kvh = hq  (requires Hq==Hkv)
@@ -243,55 +241,74 @@ static void FlexAttentionShapeInference(InferenceContext& ctx) {
   const auto& q_shape = q_type->tensor_type().shape();
   const auto& k_shape = k_type->tensor_type().shape();
   const auto& v_shape = v_type->tensor_type().shape();
-  if (q_shape.dim_size() != 4 || k_shape.dim_size() != 4 || v_shape.dim_size() != 4) {
-    fail_shape_inference("FlexAttention requires rank-4 inputs with shape (B, H, L, D).");
+  const auto q_rank = q_shape.dim_size();
+  const auto k_rank = k_shape.dim_size();
+  const auto v_rank = v_shape.dim_size();
+  if ((q_rank != 3 && q_rank != 4) || q_rank != k_rank || q_rank != v_rank) {
+    fail_shape_inference("FlexAttention requires all inputs to have rank 3 or rank 4 (matched).");
   }
 
-  // Validate head sizes between K and V.
-  if (k_shape.dim(1).has_dim_value() && v_shape.dim(1).has_dim_value() &&
-      k_shape.dim(1).dim_value() != v_shape.dim(1).dim_value()) {
-    fail_shape_inference("Key and value must share the same head dimension.");
+  const bool is_3d = q_rank == 3;
+
+  // Validate head sizes between K and V (only for 4D path).
+  if (!is_3d) {
+    if (k_shape.dim(1).has_dim_value() && v_shape.dim(1).has_dim_value() &&
+        k_shape.dim(1).dim_value() != v_shape.dim(1).dim_value()) {
+      fail_shape_inference("Key and value must share the same head dimension.");
+    }
   }
 
   // Validate sequence length alignment between K and V.
-  if (k_shape.dim(2).has_dim_value() && v_shape.dim(2).has_dim_value() &&
-      k_shape.dim(2).dim_value() != v_shape.dim(2).dim_value()) {
+  const int seq_dim = is_3d ? 1 : 2;
+  if (k_shape.dim(seq_dim).has_dim_value() && v_shape.dim(seq_dim).has_dim_value() &&
+      k_shape.dim(seq_dim).dim_value() != v_shape.dim(seq_dim).dim_value()) {
     fail_shape_inference("Key and value must share the same sequence length.");
   }
 
   // Validate depth alignment between Q and K.
-  if (q_shape.dim(3).has_dim_value() && k_shape.dim(3).has_dim_value() &&
-      q_shape.dim(3).dim_value() != k_shape.dim(3).dim_value()) {
+  const int depth_dim = is_3d ? 2 : 3;
+  if (q_shape.dim(depth_dim).has_dim_value() && k_shape.dim(depth_dim).has_dim_value() &&
+      q_shape.dim(depth_dim).dim_value() != k_shape.dim(depth_dim).dim_value()) {
     fail_shape_inference("Query and key must share the same embedding dimension.");
   }
 
   const auto enable_gqa = getAttribute(ctx, "enable_gqa", 0);
-  if (enable_gqa == 0) {
-    if (q_shape.dim(1).has_dim_value() && k_shape.dim(1).has_dim_value() &&
-        q_shape.dim(1).dim_value() != k_shape.dim(1).dim_value()) {
-      fail_shape_inference("enable_gqa=0 requires Hq == Hkv.");
-    }
-  } else {
-    if (q_shape.dim(1).has_dim_value() && k_shape.dim(1).has_dim_value()) {
-      const auto hq = q_shape.dim(1).dim_value();
-      const auto hkv = k_shape.dim(1).dim_value();
-      if (hkv <= 0 || (hq % hkv) != 0) {
-        fail_shape_inference("enable_gqa=1 requires Hq to be divisible by Hkv.");
+  if (!is_3d) {
+    if (enable_gqa == 0) {
+      if (q_shape.dim(1).has_dim_value() && k_shape.dim(1).has_dim_value() &&
+          q_shape.dim(1).dim_value() != k_shape.dim(1).dim_value()) {
+        fail_shape_inference("enable_gqa=0 requires Hq == Hkv.");
+      }
+    } else {
+      if (q_shape.dim(1).has_dim_value() && k_shape.dim(1).has_dim_value()) {
+        const auto hq = q_shape.dim(1).dim_value();
+        const auto hkv = k_shape.dim(1).dim_value();
+        if (hkv <= 0 || (hq % hkv) != 0) {
+          fail_shape_inference("enable_gqa=1 requires Hq to be divisible by Hkv.");
+        }
       }
     }
   }
 
   auto* output_shape = output_type->mutable_shape();
   output_shape->clear_dim();
-  *output_shape->add_dim() = q_shape.dim(0);
-  *output_shape->add_dim() = q_shape.dim(1);
-  *output_shape->add_dim() = q_shape.dim(2);
-  *output_shape->add_dim() = v_shape.dim(3);
+  if (is_3d) {
+    *output_shape->add_dim() = q_shape.dim(0);
+    *output_shape->add_dim() = q_shape.dim(1);
+    *output_shape->add_dim() = v_shape.dim(2);
+    mergeInDimensionInfo(k_shape.dim(0), *output_shape->mutable_dim(0), 0);
+    mergeInDimensionInfo(v_shape.dim(0), *output_shape->mutable_dim(0), 0);
+  } else {
+    *output_shape->add_dim() = q_shape.dim(0);
+    *output_shape->add_dim() = q_shape.dim(1);
+    *output_shape->add_dim() = q_shape.dim(2);
+    *output_shape->add_dim() = v_shape.dim(3);
 
-  mergeInDimensionInfo(k_shape.dim(0), *output_shape->mutable_dim(0), 0);
-  mergeInDimensionInfo(v_shape.dim(0), *output_shape->mutable_dim(0), 0);
-  if (enable_gqa == 0) {
-    mergeInDimensionInfo(k_shape.dim(1), *output_shape->mutable_dim(1), 1);
+    mergeInDimensionInfo(k_shape.dim(0), *output_shape->mutable_dim(0), 0);
+    mergeInDimensionInfo(v_shape.dim(0), *output_shape->mutable_dim(0), 0);
+    if (enable_gqa == 0) {
+      mergeInDimensionInfo(k_shape.dim(1), *output_shape->mutable_dim(1), 1);
+    }
   }
 
   const size_t mod_input_count = (ctx.getNumInputs() > 3) ? (ctx.getNumInputs() - 3) : 0;
@@ -332,11 +349,42 @@ static bool BuildFlexAttentionFunction(
     return false;
   }
 
+  const auto& q_shape = q_type->tensor_type().shape();
+  const auto& k_shape = k_type->tensor_type().shape();
+  const auto& v_shape = v_type->tensor_type().shape();
+  if (q_shape.dim_size() == 0 || k_shape.dim_size() == 0 || v_shape.dim_size() == 0) {
+    return false;
+  }
+  const bool is_3d = (q_shape.dim_size() == 3 && k_shape.dim_size() == 3 && v_shape.dim_size() == 3);
+  const bool is_4d = (q_shape.dim_size() == 4 && k_shape.dim_size() == 4 && v_shape.dim_size() == 4);
+  if (!is_3d && !is_4d) {
+    return false;
+  }
+
   FunctionBuilder builder(functionProto);
-  builder.Add("KTranspose = Transpose <perm = [0, 1, 3, 2]> (K)")
-      .Add("Score = MatMul (Q, KTranspose)")
-      .Add("Prob = Softmax <axis = 3> (Score)")
-      .Add("Y = MatMul (Prob, V)");
+  if (is_3d) {
+    builder.Add("Batch = Shape <start = 0, end = 1> (Q)")
+        .Add("QSeq = Shape <start = 1, end = 2> (Q)")
+        .Add("KSeq = Shape <start = 1, end = 2> (K)")
+        .Add("Embed = Shape <start = 2, end = 3> (Q)")
+        .Const1D("One", static_cast<int64_t>(1))
+        .Add("QReshapeShape = Concat <axis = 0> (Batch, One, QSeq, Embed)")
+        .Add("KReshapeShape = Concat <axis = 0> (Batch, One, KSeq, Embed)")
+        .Add("QReshaped = Reshape (Q, QReshapeShape)")
+        .Add("KReshaped = Reshape (K, KReshapeShape)")
+        .Add("VReshapeShape = Concat <axis = 0> (Batch, One, KSeq, Shape <start = 2, end = 3> (V))")
+        .Add("VReshaped = Reshape (V, VReshapeShape)")
+        .Add("KTranspose = Transpose <perm = [0, 1, 3, 2]> (KReshaped)")
+        .Add("Score = MatMul (QReshaped, KTranspose)")
+        .Add("Prob = Softmax <axis = 3> (Score)")
+        .Add("Y4D = MatMul (Prob, VReshaped)")
+        .Add("Y = Squeeze <axes = [1]> (Y4D)");
+  } else {
+    builder.Add("KTranspose = Transpose <perm = [0, 1, 3, 2]> (K)")
+        .Add("Score = MatMul (Q, KTranspose)")
+        .Add("Prob = Softmax <axis = 3> (Score)")
+        .Add("Y = MatMul (Prob, V)");
+  }
   schema.BuildFunction(functionProto);
   return true;
 }
@@ -346,9 +394,9 @@ ONNX_PREVIEW_OPERATOR_SET_SCHEMA(
     1,
     OpSchema()
         .SetDoc(FlexAttention_ver1_doc)
-        .Input(0, "query", "Query tensor. Shape (B, Hq, L, E).", "T")
-        .Input(1, "key", "Key tensor. Shape (B, Hkv, S, E).", "T")
-        .Input(2, "value", "Value tensor. Shape (B, Hkv, S, Ev).", "T")
+        .Input(0, "query", "Query tensor. Shape (B, Hq, L, E) or (B, L, E).", "T")
+        .Input(1, "key", "Key tensor. Shape (B, Hkv, S, E) or (B, S, E).", "T")
+        .Input(2, "value", "Value tensor. Shape (B, Hkv, S, Ev) or (B, S, Ev).", "T")
         .Input(
             3,
             "mod_inputs",

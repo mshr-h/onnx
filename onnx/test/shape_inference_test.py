@@ -7419,6 +7419,33 @@ class TestShapeInference(TestShapeInferenceHelper):
                 ],
             )
 
+    def test_flexattention_3d_inputs(self) -> None:
+        graph = self._make_graph(
+            [
+                ("Q", TensorProto.FLOAT, (2, 8, 16)),
+                ("K", TensorProto.FLOAT, (2, 8, 16)),
+                ("V", TensorProto.FLOAT, (2, 8, 32)),
+            ],
+            [
+                make_node(
+                    "FlexAttention",
+                    ["Q", "K", "V"],
+                    ["Y"],
+                    domain=AI_ONNX_PREVIEW_DOMAIN,
+                )
+            ],
+            [make_tensor_value_info("Y", TensorProto.FLOAT, (None, None, None))],
+        )
+
+        self._assert_inferred(
+            graph,
+            [make_tensor_value_info("Y", TensorProto.FLOAT, (2, 8, 32))],
+            opset_imports=[
+                make_opsetid(ONNX_DOMAIN, 26),
+                make_opsetid(AI_ONNX_PREVIEW_DOMAIN, 1),
+            ],
+        )
+
     def test_pad_opset10(self) -> None:
         graph = self._make_graph(
             [("x", TensorProto.FLOAT, (1, None, 2))],
