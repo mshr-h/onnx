@@ -10,154 +10,6 @@
 
 namespace ONNX_NAMESPACE {
 
-static constexpr const char* FlexAttention_ver1_doc = R"DOC(
-Computes scaled dot-product attention with user-provided customization subgraphs
-at up to three stages:
-  (1) score_mod: modify each scalar attention score after Q·K^T
-  (2) mask_mod : determine which (q_idx, kv_idx) connections are allowed
-  (3) prob_mod : modify each scalar probability after Softmax
-
-Inputs
-------
-1) query (Q) : T
-   Query tensor. Shape: (B, Hq, L, E) or (B, L, E) for single-head inputs.
-
-2) key (K) : T
-   Key tensor. Shape: (B, Hkv, S, E) or (B, S, E) for single-head inputs.
-
-3) value (V) : T
-   Value tensor. Shape: (B, Hkv, S, Ev) or (B, S, Ev) for single-head inputs.
-
-4) mod_inputs (optional, variadic) : TMod...
-   Extra tensors forwarded to score_mod/mask_mod/prob_mod graphs, enabling
-   parameterized modifications (e.g., per-head slopes, learned bias, dynamic masks).
-   Each graph MAY ignore unused mod_inputs.
-   (This is necessary because GraphProto attributes have no closure over runtime tensors.)
-
-Outputs
--------
-1) output (Y) : T
-   Attention output. Shape: (B, Hq, L, Ev) for 4D inputs or (B, L, Ev) for 3D inputs.
-
-Attributes
-----------
-scale : FLOAT (optional)
-  Multiplicative scaling applied to raw dot-product scores prior to score_mod/mask/softmax.
-  If omitted, exporters SHOULD set it explicitly to avoid ambiguity across implementations.
-
-enable_gqa : INT (default = 0)
-  If 0: requires Hq == Hkv.
-  If 1: enables Grouped Query Attention; key/value heads are broadcast to query heads.
-         Requires Hq % Hkv == 0.
-
-mask_value : FLOAT (default = -3.402823466e+38)
-  Value used to replace masked scores before Softmax (i.e., an approximation of -inf).
-  Backends may clamp as needed for the chosen T.
-
-score_mod : GRAPH (optional)
-  A subgraph that modifies each scalar attention score.
-  Signature (positional inputs):
-    (score, batch, head, q_idx, kv_idx, *mod_inputs) -> (score_out)
-  Input/Output requirements:
-    - score      : TScalar (a scalar tensor with element type compatible with T)
-    - batch/head/q_idx/kv_idx : TI (scalar int indices)
-    - score_out  : same type as score
-  The graph MUST have exactly 1 output.
-  Intended to match PyTorch score_mod signature:
-    def score_mod(score, batch, head, q_idx, k_idx) -> score'    (PyTorch uses torch.int for indices).
-
-mask_mod : GRAPH (optional)
-  A subgraph that decides whether a score position is allowed.
-  Signature (positional inputs):
-    (batch, head, q_idx, kv_idx, *mod_inputs) -> (mask_out)
-  Requirements:
-    - batch/head/q_idx/kv_idx : TI (scalar int indices)
-    - mask_out : tensor(bool) scalar; True = allowed, False = masked.
-  The graph MUST have exactly 1 output.
-  Intended to match PyTorch mask_mod signature used by create_block_mask:
-    def mask_mod(b, h, q_idx, kv_idx) -> bool
-
-prob_mod : GRAPH (optional)
-  A subgraph that modifies each scalar probability AFTER Softmax.
-  Signature (positional inputs):
-    (prob, batch, head, q_idx, kv_idx, *mod_inputs) -> (prob_out)
-  Requirements:
-    - prob      : TScalar
-    - indices   : TI
-    - prob_out  : same type as prob
-  The graph MUST have exactly 1 output.
-  Note: prob_out is NOT automatically renormalized by this operator; if a model
-  requires renormalization, prob_mod should implement it.
-
-Type Constraints
-----------------
-T : tensor(float), tensor(float16), tensor(bfloat16),
-    tensor(float8e4m3fn), tensor(float8e4m3fnuz),
-    tensor(float8e5m2), tensor(float8e5m2fnuz),
-    tensor(float8e8m0)
-  (ONNX has defined float8 formats; see ONNX float8 documentation and operator schema usage.)
-
-TScalar :
-  scalar tensor whose element type is the same as T's element type.
-  (i.e., 0-dim tensor(T_elem))
-
-TI : tensor(int64) or tensor(int32)
-  Scalar index tensors.
-
-TMod :
-  tensor(float), tensor(float16), tensor(bfloat16),
-  tensor(float8e4m3fn), tensor(float8e4m3fnuz),
-  tensor(float8e5m2), tensor(float8e5m2fnuz),
-  tensor(float8e8m0),
-  tensor(int64), tensor(int32), tensor(bool)
-  (Deliberately broad: mod graphs may consume parameters of different dtypes.)
-
-Shape Constraints & Semantics
------------------------------
-Let:
-  Q: (B, Hq, L, E) or (B, L, E)
-  K: (B, Hkv, S, E) or (B, S, E)
-  V: (B, Hkv, S, Ev) or (B, S, Ev)
-
-Head mapping:
-  if enable_gqa == 0: kvh = hq  (requires Hq==Hkv)
-  if enable_gqa == 1:
-     group = Hq / Hkv
-     kvh = floor(hq / group)     (equivalent to repeating K,V along head axis)
-
-For each b in [0,B), hq in [0,Hq), q in [0,L), kv in [0,S):
-  raw = dot(Q[b,hq,q,:], K[b,kvh,kv,:])
-  s   = (raw * scale) if scale provided else raw
-  if score_mod provided:
-      s = score_mod(s, b, hq, q, kv, *mod_inputs)
-  if mask_mod provided:
-      m = mask_mod(b, hq, q, kv, *mod_inputs)   # bool
-      if m == False: s = mask_value
-
-Let P[b,hq,q,:] = Softmax over kv dimension of S[b,hq,q,:].
-
-If prob_mod provided:
-  For each kv:
-     P[b,hq,q,kv] = prob_mod(P[b,hq,q,kv], b, hq, q, kv, *mod_inputs)
-
-Output:
-  Y[b,hq,q,:] = Σ_{kv} P[b,hq,q,kv] * V[b,kvh,kv,:]
-
-Notes:
-  - If score_mod/mask_mod/prob_mod are absent, they behave as identity / allow-all / identity.
-  - Graph attributes must be side-effect-free and deterministic for portability.
-  - Reference ONNX Function fallback may be slow (elementwise modifications); optimized EPs
-    can fuse the pattern.
-
-Documentation (operator docstring)
-----------------------------------
-"FlexAttention computes scaled dot-product attention between query, key, and value,
-with optional customization subgraphs applied per-element to scores (score_mod),
-masking decisions (mask_mod), and probabilities after softmax (prob_mod). This enables
-export of flexible attention patterns (e.g., ALiBi, custom masking, post-softmax quantization)
-without decomposing into many small ops, while still allowing backends to fuse the full pattern."
-)DOC";
-
 static void ValidateFlexAttentionGraph(
     InferenceContext& ctx,
     const AttributeProto* attr,
@@ -389,26 +241,27 @@ static bool BuildFlexAttentionFunction(
   return true;
 }
 
+static constexpr const char* FlexAttention_ver1_doc = R"DOC(
+computes scaled dot-product attention, with optional custom
+subgraphs injected at three stages:
+
+  1) score_mod: applied to raw attention scores (QK^T * scale, before any mask)
+  2) mask_mod : applied after built-in masking (attn_mask and/or is_causal), before softmax
+  3) prob_mod : applied to probabilities after softmax, before multiplying by V
+
+Each *_mod attribute is a GraphProto (graph attribute). If an attribute is not
+provided, the corresponding stage is treated as identity.
+)DOC";
+
 ONNX_PREVIEW_OPERATOR_SET_SCHEMA(
     FlexAttention,
     1,
     OpSchema()
         .SetDoc(FlexAttention_ver1_doc)
-        .Input(0, "query", "Query tensor. Shape (B, Hq, L, E) or (B, L, E).", "T")
-        .Input(1, "key", "Key tensor. Shape (B, Hkv, S, E) or (B, S, E).", "T")
-        .Input(2, "value", "Value tensor. Shape (B, Hkv, S, Ev) or (B, S, Ev).", "T")
-        .Input(
-            3,
-            "mod_inputs",
-            "Extra tensors forwarded to modifier graphs. Ignored when corresponding graphs are absent.",
-            "TMod",
-            OpSchema::Variadic,
-            false,
-            0)
-        .Output(0, "output", "Attention output. Shape (B, Hq, L, Ev).", "T")
         .Attr(
             "scale",
-            "Multiplicative scaling applied to raw dot-product scores prior to modifiers and softmax.",
+            "Scaling factor applied to $Q*K^T$. Default value is `1/sqrt(head_size)`. To prevent "
+            "[numerical overflow](https://tinyurl.com/sudb9s96), scale `Q`, `K` by `sqrt(scale)` before matmul.",
             AttributeProto::FLOAT,
             OPTIONAL_VALUE)
         .Attr(
@@ -421,11 +274,103 @@ ONNX_PREVIEW_OPERATOR_SET_SCHEMA(
             "Value used to replace masked scores before Softmax (approximation of -inf).",
             AttributeProto::FLOAT,
             -3.402823466e+38f)
-        .Attr("score_mod", "Optional score modifier graph.", AttributeProto::GRAPH, OPTIONAL_VALUE)
-        .Attr("mask_mod", "Optional mask modifier graph.", AttributeProto::GRAPH, OPTIONAL_VALUE)
-        .Attr("prob_mod", "Optional probability modifier graph.", AttributeProto::GRAPH, OPTIONAL_VALUE)
+        .Attr(
+            "q_num_heads",
+            "Number of heads of query. Must be used with 3D inputs of Q, K and V. ",
+            AttributeProto::INT,
+            OPTIONAL_VALUE)
+        .Attr(
+            "kv_num_heads",
+            "Number of heads of key and value. Must be used with 3D inputs of Q, K and V. ",
+            AttributeProto::INT,
+            OPTIONAL_VALUE)
+        .Attr(
+            "softmax_precision",
+            "The floating-point precision used in softmax computation. "
+            "If softmax precision is not provided, the same precision as the input of softmax (Q and K) is used.",
+            AttributeProto::INT,
+            OPTIONAL_VALUE)
+        .Attr("score_mod",
+          R"DOC(
+GraphProto applied to attention scores right after QK^T*scale,
+before any masking. Expected signature:
+
+  Inputs : (scores)
+  Outputs: (scores_out)
+
+Where scores is a 4D tensor shaped (batch_size, q_num_heads, q_seq_len, total_seq_len)
+in the internal canonical form.
+The subgraph must return the same shape and element type as input.
+)DOC",
+            AttributeProto::GRAPH, OPTIONAL)
+        .Attr("mask_mod",
+          R"DOC(
+GraphProto applied after built-in masking (attn_mask and/or is_causal),
+before softmax. Expected signature:
+
+  Inputs : (scores)
+  Outputs: (scores_out)
+
+Must preserve shape and element type.
+Note: This stage is intended for additional or alternative masking logic;
+implementations may choose to fuse this with mask application.
+)DOC",
+            AttributeProto::GRAPH, OPTIONAL)
+        .Attr("prob_mod",
+          R"DOC(
+GraphProto applied to probabilities after softmax, before MatMul with V.
+Expected signature:
+
+  Inputs : (probs)
+  Outputs: (probs_out)
+
+Where probs is a 4D tensor shaped (batch_size, q_num_heads, q_seq_len, total_seq_len)
+in the internal canonical form.
+Must preserve shape and element type.
+)DOC",
+            AttributeProto::GRAPH, OPTIONAL)
+        .Input(
+            0,
+            "Q",
+            "Query tensor. "
+            "4D tensor with shape `(batch_size, q_num_heads, q_sequence_length, head_size)` or 3D tensor with shape `(batch_size, q_sequence_length, q_hidden_size)`. "
+            "For cases with a 3D input tensor, `q_hidden_size = q_num_heads * head_size`",
+            "T1")
+        .Input(
+            1,
+            "K",
+            "Key tensor. "
+            "4D tensor with shape `(batch_size, kv_num_heads, kv_sequence_length, head_size)` or 3D tensor with shape `(batch_size, kv_sequence_length, k_hidden_size)`. "
+            "For cases with a 3D input tensor, `k_hidden_size = kv_num_heads * head_size`",
+            "T1")
+        .Input(
+            2,
+            "V",
+            "Value tensor. "
+            "4D tensor with shape `(batch_size, kv_num_heads, kv_sequence_length, v_head_size)` or 3D tensor with shape `(batch_size, kv_sequence_length, v_hidden_size)`. "
+            "For cases with a 3D input tensor, `v_hidden_size = kv_num_heads * v_head_size`",
+            "T2")
+        .Input(3, "past_key",
+              "Optional KV-cache past key: (B, kv_num_heads, past_seq_len, head_size).",
+              "T1", OpSchema::Optional)
+        .Input(4, "past_value",
+              "Optional KV-cache past value: (B, kv_num_heads, past_seq_len, v_head_size).",
+              "T2", OpSchema::Optional)
+        .Input(5, "nonpad_kv_seqlen",
+              "Optional vector (B,) indicating valid tokens per sample; "
+              "should not be used together with past/present KV-cache.",
+              "tensor(int64)", OpSchema::Optional)
+        .Input(
+            3,
+            "mod_inputs",
+            "Extra tensors forwarded to modifier graphs. Ignored when corresponding graphs are absent.",
+            "TMod",
+            OpSchema::Variadic,
+            false,
+            0)
+        .Output(0, "output", "Attention output. Shape (B, Hq, L, Ev).", "T")
         .TypeConstraint(
-            "T",
+            "T1",
             {"tensor(float)",
              "tensor(float16)",
              "tensor(bfloat16)",
@@ -434,7 +379,18 @@ ONNX_PREVIEW_OPERATOR_SET_SCHEMA(
              "tensor(float8e5m2)",
              "tensor(float8e5m2fnuz)",
              "tensor(float8e8m0)"},
-            "Constrain Q/K/V and output to floating-point tensors.")
+            "Constrain Q/K and output to floating-point tensors.")
+        .TypeConstraint(
+            "T2",
+            {"tensor(float)",
+             "tensor(float16)",
+             "tensor(bfloat16)",
+             "tensor(float8e4m3fn)",
+             "tensor(float8e4m3fnuz)",
+             "tensor(float8e5m2)",
+             "tensor(float8e5m2fnuz)",
+             "tensor(float8e8m0)"},
+            "Constrain V to floating-point tensors.")
         .TypeConstraint(
             "TMod",
             {"tensor(float)",
