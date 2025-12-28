@@ -332,10 +332,34 @@ ONNX_PREVIEW_OPERATOR_SET_SCHEMA(
     1,
     OpSchema()
         .SetDoc(FlexAttention_ver1_doc)
-        .Input(0, "query", "Query tensor. Shape (B, Hq, L, E).", "T")
-        .Input(1, "key", "Key tensor. Shape (B, Hkv, S, E).", "T")
-        .Input(2, "value", "Value tensor. Shape (B, Hkv, S, Ev).", "T")
-        .Output(0, "output", "Attention output. Shape (B, Hq, L, Ev).", "T")
+        .Input(
+            0,
+            "Q",
+            "Query tensor. "
+            "4D tensor with shape `(batch_size, q_num_heads, q_sequence_length, head_size)` or 3D tensor with shape `(batch_size, q_sequence_length, q_hidden_size)`. "
+            "For cases with a 3D input tensor, `q_hidden_size = q_num_heads * head_size`",
+            "T1")
+        .Input(
+            1,
+            "K",
+            "Key tensor. "
+            "4D tensor with shape `(batch_size, kv_num_heads, kv_sequence_length, head_size)` or 3D tensor with shape `(batch_size, kv_sequence_length, k_hidden_size)`. "
+            "For cases with a 3D input tensor, `k_hidden_size = kv_num_heads * head_size`",
+            "T1")
+        .Input(
+            2,
+            "V",
+            "Value tensor. "
+            "4D tensor with shape `(batch_size, kv_num_heads, kv_sequence_length, v_head_size)` or 3D tensor with shape `(batch_size, kv_sequence_length, v_hidden_size)`. "
+            "For cases with a 3D input tensor, `v_hidden_size = kv_num_heads * v_head_size`",
+            "T2")
+        .Output(
+            0,
+            "Y",
+            "The output tensor . "
+            "4D tensor with shape `(batch_size, q_num_heads, q_sequence_length, v_head_size)` or 3D tensor with shape `(batch_size, q_sequence_length, hidden_size)`. "
+            "For cases with a 3D input tensor, `hidden_size = q_num_heads * v_head_size`",
+            "T1")
         .Attr(
             "scale",
             "Multiplicative scaling applied to raw dot-product scores prior to modifiers and softmax.",
@@ -354,31 +378,8 @@ ONNX_PREVIEW_OPERATOR_SET_SCHEMA(
         .Attr("score_mod", "Optional score modifier graph.", AttributeProto::GRAPH, OPTIONAL_VALUE)
         .Attr("mask_mod", "Optional mask modifier graph.", AttributeProto::GRAPH, OPTIONAL_VALUE)
         .Attr("prob_mod", "Optional probability modifier graph.", AttributeProto::GRAPH, OPTIONAL_VALUE)
-        .TypeConstraint(
-            "T",
-            {"tensor(float)",
-             "tensor(float16)",
-             "tensor(bfloat16)",
-             "tensor(float8e4m3fn)",
-             "tensor(float8e4m3fnuz)",
-             "tensor(float8e5m2)",
-             "tensor(float8e5m2fnuz)",
-             "tensor(float8e8m0)"},
-            "Constrain Q/K/V and output to floating-point tensors.")
-        .TypeConstraint(
-            "TMod",
-            {"tensor(float)",
-             "tensor(float16)",
-             "tensor(bfloat16)",
-             "tensor(float8e4m3fn)",
-             "tensor(float8e4m3fnuz)",
-             "tensor(float8e5m2)",
-             "tensor(float8e5m2fnuz)",
-             "tensor(float8e8m0)",
-             "tensor(int32)",
-             "tensor(int64)",
-             "tensor(bool)"},
-            "Constrain modifier input tensors to common numeric/bool types.")
+        .TypeConstraint("T1", OpSchema::all_float_types_ir4(), "Constrain Q and K inputs types to float tensors.")
+        .TypeConstraint("T2", OpSchema::all_float_types_ir4(), "Constrain V input types to float tensors.")
         .TypeAndShapeInferenceFunction(FlexAttentionShapeInference)
         .SetSupportLevel(OpSchema::SupportType::EXPERIMENTAL)
         .SetNodeDeterminism(OpSchema::NodeDeterminism::Deterministic)
