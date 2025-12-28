@@ -365,6 +365,7 @@ static bool BuildFlexAttentionFunction(
       .Add("ScaleFactorSqrt = Sqrt(ScaleFactor)")
       .Add("ScaleFactorF = Cast (ScaleFactorSqrt)", "to", T1);
 
+  // TODO: Add score_mod, mask_mod, prob_mod support here
   // The following pattern is applied
   //      Q          K          V
   //      |          |          |
