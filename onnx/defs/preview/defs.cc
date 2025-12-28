@@ -11,8 +11,79 @@
 
 namespace ONNX_NAMESPACE {
 
+static void ValidateFlexAttentionGraph(
+    InferenceContext& ctx,
+    const AttributeProto* attr,
+    size_t expected_inputs,
+    const std::string& attr_name,
+    std::optional<int32_t> expected_output_elem_type) {
+  if (!attr)
+    return;
+  if (!attr->has_g()) {
+    fail_shape_inference("Attribute ", attr_name, " must be a GraphProto (type=GRAPH).");
+  }
+
+  // score_mod(score, batch, head, q_idx, k_idx) -> score'  (5 inputs, 1 output)
+  const auto& g = attr->g();
+
+  if (g.input_size() != static_cast<int>(expected_inputs)) {
+    fail_shape_inference(
+        "Attribute ",
+        attr_name,
+        " graph must have exactly ",
+        expected_inputs,
+        " inputs but got input_size=",
+        g.input_size(),
+        ".");
+  }
+
+  if (g.output_size() != 1) {
+    fail_shape_inference(
+        "Attribute ",
+        attr_name,
+        " graph must have exactly 1 output but got input_size=",
+        g.output_size(),
+        ".");
+  }
+
+  if (g.output_size() == 1 && g.output(0).has_type()) {
+    const auto& type = g.output(0).type();
+    if (!type.has_tensor_type()) {
+      fail_shape_inference("Attribute ", attr_name, " graph output must be a tensor.");
+    }
+    const auto& tensor_type = type.tensor_type();
+    if (expected_output_elem_type.has_value() && tensor_type.elem_type() != expected_output_elem_type.value()) {
+      fail_shape_inference(
+          "Attribute ",
+          attr_name,
+          " graph output element type expected to be ",
+          expected_output_elem_type.value(),
+          " but got ",
+          tensor_type.elem_type(),
+          ".");
+    }
+    if (tensor_type.has_shape() && tensor_type.shape().dim_size() != 0) {
+      fail_shape_inference("Attribute ", attr_name, " graph output must be a scalar tensor.");
+    }
+  }
+}
+
+static void FlexAttentionShapeInference(InferenceContext& ctx) {
+  defs::nn::utils::AttentionPropagateElemTypeFromInputToOutput(ctx);
+  const auto* q_type = ctx.getInputType(0);
+  const auto q_elem_type = q_type->tensor_type().elem_type();
+  ValidateFlexAttentionGraph(ctx, ctx.getAttribute("score_mod"), 5, "score_mod", q_elem_type);
+}
+
 static constexpr const char* FlexAttention_ver1_doc = R"DOC(
-TBA
+Computes scaled dot-product attention like Attention, but allows a custom
+GraphProto attribute `score_mod` to modify the raw attention scores (QK^T)
+before masking/softmax.
+
+score_mod is intended for patterns like additive bias (e.g., ALiBi), custom
+relative position bias, etc.
+
+If `score_mod` is not provided, scores are unchanged.
 )DOC";
 
 ONNX_PREVIEW_OPERATOR_SET_SCHEMA(
@@ -20,6 +91,20 @@ ONNX_PREVIEW_OPERATOR_SET_SCHEMA(
     1,
     OpSchema()
         .SetDoc(FlexAttention_ver1_doc)
+        .Attr(
+            "score_mod",
+            R"DOC(
+A subgraph that modifies the raw attention scores (before masking/softmax).
+
+Conceptually:
+  scores = MatMul(Q_scaled, Transpose(K_scaled))
+  scores = score_mod(scores, ...)   // user-defined
+
+Expected: score_mod returns a tensor broadcastable to scores' shape, or returns
+scores' same shape. (Exact signature is specified by the Function body / spec.)
+)DOC",
+            AttributeProto::GRAPH,
+            false)
         .Attr(
             "is_causal",
             "If set to `1`, the attention masking is a lower triangular matrix when the mask is a square matrix. "
@@ -150,7 +235,7 @@ ONNX_PREVIEW_OPERATOR_SET_SCHEMA(
             "U",
             OpSchema::all_non_complex_numeric_types_plus_bool_ir4(),
             "Constrain output 'mask' types to boolean tensors and input types.")
-        .TypeAndShapeInferenceFunction(defs::nn::utils::AttentionPropagateElemTypeFromInputToOutput)
+        .TypeAndShapeInferenceFunction(FlexAttentionShapeInference)
         .SetSupportLevel(OpSchema::SupportType::EXPERIMENTAL)
         .SetNodeDeterminism(OpSchema::NodeDeterminism::Deterministic)
         .SetContextDependentFunctionBodyBuilder([](const FunctionBodyBuildContext& ctx,
@@ -166,6 +251,11 @@ ONNX_PREVIEW_OPERATOR_SET_SCHEMA(
           if ((t_qk == nullptr) || (!t_qk->has_tensor_type()))
             return false;
           int64_t T1 = t_qk->tensor_type().elem_type();
+
+          // score_mod
+          if (ctx.getAttribute("score_mod") != nullptr) {
+            return false;
+          }
 
           // Determine precision types for Softmax
           auto softmax_precision_attr = ctx.getAttribute("softmax_precision");
