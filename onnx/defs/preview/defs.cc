@@ -289,111 +289,6 @@ static void FlexAttentionShapeInference(InferenceContext& ctx) {
   ValidateFlexAttentionGraph(ctx, ctx.getAttribute("prob_mod"), 5, "prob_mod", q_elem_type, true);
 }
 
-static bool BuildFlexAttentionFunction(
-    const FunctionBodyBuildContext& ctx,
-    const OpSchema& schema,
-    FunctionProto& functionProto) {
-  int64_t float_type = ONNX_NAMESPACE::TensorProto_DataType_FLOAT;
-
-  // Get input types
-  auto t_qk = ctx.getInputType(0);
-  if ((t_qk == nullptr) || (!t_qk->has_tensor_type()))
-    return false;
-  int64_t T1 = t_qk->tensor_type().elem_type();
-
-  // Determine precision types for Softmax
-  auto softmax_precision_attr = ctx.getAttribute("softmax_precision");
-  int64_t softmax_precision = (softmax_precision_attr != nullptr) ? softmax_precision_attr->i() : T1;
-  if ((softmax_precision != ONNX_NAMESPACE::TensorProto_DataType_FLOAT) &&
-      (softmax_precision != ONNX_NAMESPACE::TensorProto_DataType_BFLOAT16) &&
-      (softmax_precision != ONNX_NAMESPACE::TensorProto_DataType_FLOAT16) &&
-      (softmax_precision != ONNX_NAMESPACE::TensorProto_DataType_DOUBLE)) {
-    return false;
-  }
-
-  if (ctx.getAttribute("enable_gqa") != nullptr && ctx.getAttribute("enable_gqa")->i() != 0) {
-    return false;
-  }
-
-  // Provide a dense, no-modifier reference path only when graph attributes and extra inputs are absent.
-  if (ctx.getAttribute("score_mod") != nullptr || ctx.getAttribute("mask_mod") != nullptr ||
-      ctx.getAttribute("prob_mod") != nullptr) {
-    return false;
-  }
-
-  const auto* q_type = ctx.getInputType(0);
-  const auto* k_type = ctx.getInputType(1);
-  const auto* v_type = ctx.getInputType(2);
-  if (!q_type || !k_type || !v_type || !q_type->has_tensor_type() || !k_type->has_tensor_type() ||
-      !v_type->has_tensor_type()) {
-    return false;
-  }
-
-  const auto q_elem_type = q_type->tensor_type().elem_type();
-  if (k_type->tensor_type().elem_type() != q_elem_type || v_type->tensor_type().elem_type() != q_elem_type) {
-    return false;
-  }
-
-  FunctionBuilder builder(functionProto);
-  builder
-      .Add("BatchSize = Shape <start = 0, end = 1> (Q)") // batch size
-      .Add("QSeqLen = Shape <start = -2, end = -1> (Q)") // q_sequence_length
-      .Add("KVSeqLen = Shape <start = -2, end = -1> (K)"); // kv_sequence_length
-
-  // For 4D inputs: Already in desired shape [batch_size, num_heads, seq_length, head_size]
-  builder.Add("QReshaped = Identity(Q)").Add("KReshaped = Identity(K)").Add("VReshaped = Identity(V)");
-
-  builder
-      .Add("QNumHeads = Shape <start = 1, end = 2> (QReshaped)") // q_num_heads
-      .Add("KVNumHeads = Shape <start = 1, end = 2> (KReshaped)"); // kv_num_heads
-
-  // Calculate scaling factor if scale attribute not provided
-  auto scale_attr = ctx.getAttribute("scale");
-  float scale = (scale_attr != nullptr) ? scale_attr->f() : static_cast<float>(1);
-  builder
-      .Add("QKHeadSize = Shape <start = 3, end = 4> (QReshaped)") // head_size for Q and K
-      .Add("QKHeadSizeF = Cast (QKHeadSize)", "to", float_type)
-      .Add("VHeadSize = Shape <start = 3, end = 4> (VReshaped)") // head_size for V
-      .Add("SqrtHeadSize = Sqrt(QKHeadSizeF)")
-      .Const1D("One1D", static_cast<int64_t>(1))
-      .Const1D("NegOne1D", static_cast<int64_t>(-1))
-      .Const1D("One1DF", static_cast<float>(1))
-      .Const1D("Zero1D", static_cast<int64_t>(0))
-      .Add("CalculatedScale = Div(One1DF, SqrtHeadSize)")
-      .Const("ScaleF", ToTensor<float>(scale))
-      .Add(scale_attr != nullptr ? "ScaleFactor = Identity(ScaleF)" : "ScaleFactor = Identity(CalculatedScale)")
-      .Add("ScaleFactorSqrt = Sqrt(ScaleFactor)")
-      .Add("ScaleFactorF = Cast (ScaleFactorSqrt)", "to", T1);
-
-  // TODO: Add score_mod, mask_mod, prob_mod support here
-  // The following pattern is applied
-  //      Q          K          V
-  //      |          |          |
-  //     Q*scale    K*scale     |
-  //      |          |          |
-  //      |       Transpose     |
-  //      |          |          |
-  //      ---MatMul---          |
-  //            |               |
-  //            |               |
-  //         Softmax            |
-  //            |               |
-  //            -----MatMul------
-  //                    |
-  //                    Y
-  builder.Add("KTranspose = Transpose <perm = [0, 1, 3, 2]> (KReshaped)")
-      .Add("QScaled = Mul(QReshaped, ScaleFactorF)")
-      .Add("KScaled = Mul(KTranspose, ScaleFactorF)")
-      .Add("Score = MatMul(QScaled, KScaled)")
-      .Add("ScoreCast = Cast (Score)", "to", T1)
-      .Add("SoftmaxCast = Cast (Score)", "to", softmax_precision)
-      .Add("Prob = Softmax <axis = 3> (SoftmaxCast)")
-      .Add("Y = MatMul (Prob, V)");
-
-  schema.BuildFunction(functionProto);
-  return true;
-}
-
 ONNX_PREVIEW_OPERATOR_SET_SCHEMA(
     FlexAttention,
     1,
@@ -456,6 +351,107 @@ ONNX_PREVIEW_OPERATOR_SET_SCHEMA(
         .TypeAndShapeInferenceFunction(FlexAttentionShapeInference)
         .SetSupportLevel(OpSchema::SupportType::EXPERIMENTAL)
         .SetNodeDeterminism(OpSchema::NodeDeterminism::Deterministic)
-        .SetContextDependentFunctionBodyBuilder(BuildFlexAttentionFunction));
+        .SetContextDependentFunctionBodyBuilder([](const FunctionBodyBuildContext& ctx,
+                                                   const OpSchema& schema,
+                                                   FunctionProto& functionProto) {
+          int64_t float_type = ONNX_NAMESPACE::TensorProto_DataType_FLOAT;
 
+          // Get input types
+          auto t_qk = ctx.getInputType(0);
+          if ((t_qk == nullptr) || (!t_qk->has_tensor_type()))
+            return false;
+          int64_t T1 = t_qk->tensor_type().elem_type();
+
+          // Determine precision types for Softmax
+          auto softmax_precision_attr = ctx.getAttribute("softmax_precision");
+          int64_t softmax_precision = (softmax_precision_attr != nullptr) ? softmax_precision_attr->i() : T1;
+          if ((softmax_precision != ONNX_NAMESPACE::TensorProto_DataType_FLOAT) &&
+              (softmax_precision != ONNX_NAMESPACE::TensorProto_DataType_BFLOAT16) &&
+              (softmax_precision != ONNX_NAMESPACE::TensorProto_DataType_FLOAT16) &&
+              (softmax_precision != ONNX_NAMESPACE::TensorProto_DataType_DOUBLE)) {
+            return false;
+          }
+
+          if (ctx.getAttribute("enable_gqa") != nullptr && ctx.getAttribute("enable_gqa")->i() != 0) {
+            return false;
+          }
+
+          // Provide a dense, no-modifier reference path only when graph attributes and extra inputs are absent.
+          if (ctx.getAttribute("score_mod") != nullptr || ctx.getAttribute("mask_mod") != nullptr ||
+              ctx.getAttribute("prob_mod") != nullptr) {
+            return false;
+          }
+
+          const auto* q_type = ctx.getInputType(0);
+          const auto* k_type = ctx.getInputType(1);
+          const auto* v_type = ctx.getInputType(2);
+          if (!q_type || !k_type || !v_type || !q_type->has_tensor_type() || !k_type->has_tensor_type() ||
+              !v_type->has_tensor_type()) {
+            return false;
+          }
+
+          const auto q_elem_type = q_type->tensor_type().elem_type();
+          if (k_type->tensor_type().elem_type() != q_elem_type || v_type->tensor_type().elem_type() != q_elem_type) {
+            return false;
+          }
+
+          FunctionBuilder builder(functionProto);
+          builder
+              .Add("BatchSize = Shape <start = 0, end = 1> (Q)") // batch size
+              .Add("QSeqLen = Shape <start = -2, end = -1> (Q)") // q_sequence_length
+              .Add("KVSeqLen = Shape <start = -2, end = -1> (K)"); // kv_sequence_length
+
+          // For 4D inputs: Already in desired shape [batch_size, num_heads, seq_length, head_size]
+          builder.Add("QReshaped = Identity(Q)").Add("KReshaped = Identity(K)").Add("VReshaped = Identity(V)");
+
+          builder
+              .Add("QNumHeads = Shape <start = 1, end = 2> (QReshaped)") // q_num_heads
+              .Add("KVNumHeads = Shape <start = 1, end = 2> (KReshaped)"); // kv_num_heads
+
+          // Calculate scaling factor if scale attribute not provided
+          auto scale_attr = ctx.getAttribute("scale");
+          float scale = (scale_attr != nullptr) ? scale_attr->f() : static_cast<float>(1);
+          builder
+              .Add("QKHeadSize = Shape <start = 3, end = 4> (QReshaped)") // head_size for Q and K
+              .Add("QKHeadSizeF = Cast (QKHeadSize)", "to", float_type)
+              .Add("VHeadSize = Shape <start = 3, end = 4> (VReshaped)") // head_size for V
+              .Add("SqrtHeadSize = Sqrt(QKHeadSizeF)")
+              .Const1D("One1D", static_cast<int64_t>(1))
+              .Const1D("NegOne1D", static_cast<int64_t>(-1))
+              .Const1D("One1DF", static_cast<float>(1))
+              .Const1D("Zero1D", static_cast<int64_t>(0))
+              .Add("CalculatedScale = Div(One1DF, SqrtHeadSize)")
+              .Const("ScaleF", ToTensor<float>(scale))
+              .Add(scale_attr != nullptr ? "ScaleFactor = Identity(ScaleF)" : "ScaleFactor = Identity(CalculatedScale)")
+              .Add("ScaleFactorSqrt = Sqrt(ScaleFactor)")
+              .Add("ScaleFactorF = Cast (ScaleFactorSqrt)", "to", T1);
+
+          // TODO: Add score_mod, mask_mod, prob_mod support here
+          // The following pattern is applied
+          //      Q          K          V
+          //      |          |          |
+          //     Q*scale    K*scale     |
+          //      |          |          |
+          //      |       Transpose     |
+          //      |          |          |
+          //      ---MatMul---          |
+          //            |               |
+          //            |               |
+          //         Softmax            |
+          //            |               |
+          //            -----MatMul------
+          //                    |
+          //                    Y
+          builder.Add("KTranspose = Transpose <perm = [0, 1, 3, 2]> (KReshaped)")
+              .Add("QScaled = Mul(QReshaped, ScaleFactorF)")
+              .Add("KScaled = Mul(KTranspose, ScaleFactorF)")
+              .Add("Score = MatMul(QScaled, KScaled)")
+              .Add("ScoreCast = Cast (Score)", "to", T1)
+              .Add("SoftmaxCast = Cast (Score)", "to", softmax_precision)
+              .Add("Prob = Softmax <axis = 3> (SoftmaxCast)")
+              .Add("Y = MatMul (Prob, V)");
+
+          schema.BuildFunction(functionProto);
+          return true;
+        }));
 } // namespace ONNX_NAMESPACE
