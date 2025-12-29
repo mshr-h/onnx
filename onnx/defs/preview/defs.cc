@@ -14,7 +14,7 @@ static constexpr const char* FlexAttention_ver1_doc = R"DOC(
 Computes scaled dot-product attention with user-provided customization subgraphs
 at up to three stages:
   (1) score_mod: modify each scalar attention score after Q·K^T
-  (2) mask_mod : determine which (q_idx, kv_idx) connections are allowed
+  (2) mask_mod : determine which (q_idx, k_idx) connections are allowed
   (3) prob_mod : modify each scalar probability after Softmax
 This mirrors PyTorch's torch.nn.attention.flex_attention behavior.  (PyTorch is
 prototype; ONNX uses preview domain for incubation.)
@@ -53,10 +53,10 @@ mask_value : FLOAT (default = -3.402823466e+38)
 score_mod : GRAPH (optional)
   A subgraph that modifies each scalar attention score.
   Signature (positional inputs):
-    (score, batch, head, q_idx, kv_idx) -> (score_out)
+    (score, batch, head, q_idx, k_idx) -> (score_out)
   Input/Output requirements:
     - score      : TScalar (a scalar tensor with element type compatible with T)
-    - batch/head/q_idx/kv_idx : TI (scalar int indices)
+    - batch/head/q_idx/k_idx : TI (scalar int indices)
     - score_out  : same type as score
   The graph MUST have exactly 1 output.
   Intended to match PyTorch score_mod signature:
@@ -65,18 +65,18 @@ score_mod : GRAPH (optional)
 mask_mod : GRAPH (optional)
   A subgraph that decides whether a score position is allowed.
   Signature (positional inputs):
-    (batch, head, q_idx, kv_idx) -> (mask_out)
+    (batch, head, q_idx, k_idx) -> (mask_out)
   Requirements:
-    - batch/head/q_idx/kv_idx : TI (scalar int indices)
+    - batch/head/q_idx/k_idx : TI (scalar int indices)
     - mask_out : tensor(bool) scalar; True = allowed, False = masked.
   The graph MUST have exactly 1 output.
   Intended to match PyTorch mask_mod signature used by create_block_mask:
-    def mask_mod(b, h, q_idx, kv_idx) -> bool
+    def mask_mod(b, h, q_idx, k_idx) -> bool
 
 prob_mod : GRAPH (optional)
   A subgraph that modifies each scalar probability AFTER Softmax.
   Signature (positional inputs):
-    (prob, batch, head, q_idx, kv_idx) -> (prob_out)
+    (prob, batch, head, q_idx, k_idx) -> (prob_out)
   Requirements:
     - prob      : TScalar
     - indices   : TI
@@ -170,13 +170,7 @@ static void ValidateFlexAttentionGraph(
   const auto& g = attr->g();
   if (g.input_size() != static_cast<int>(expected_inputs)) {
     fail_shape_inference(
-        "Attribute ",
-        attr_name,
-        " expected ",
-        expected_inputs,
-        " inputs but graph has ",
-        g.input_size(),
-        ".");
+        "Attribute ", attr_name, " expected ", expected_inputs, " inputs but graph has ", g.input_size(), ".");
   }
 
   if (g.output_size() != 1) {
@@ -314,7 +308,7 @@ ONNX_PREVIEW_OPERATOR_SET_SCHEMA(
             "Value tensor. "
             "4D tensor with shape `(batch_size, kv_num_heads, kv_sequence_length, v_head_size)` or 3D tensor with shape `(batch_size, kv_sequence_length, v_hidden_size)`. "
             "For cases with a 3D input tensor, `v_hidden_size = kv_num_heads * v_head_size`",
-            "T2")
+            "T1")
         .Output(
             0,
             "Y",
@@ -343,17 +337,27 @@ ONNX_PREVIEW_OPERATOR_SET_SCHEMA(
             "Value used to replace masked scores before Softmax (approximation of -inf).",
             AttributeProto::FLOAT,
             -3.402823466e+38f)
-        .Attr("score_mod", "Optional score modifier graph.", AttributeProto::GRAPH, OPTIONAL_VALUE)
+        .Attr(
+            "score_mod",
+            "Optional score modifier graph.\n"
+            "The graph MUST have exactly 5 inputs in this exact order and names:\n"
+            "  (score, batch, head, q_idx, k_idx)\n"
+            "and exactly 1 output (score_out).\n"
+            "All five inputs are scalar tensors; the output is a scalar tensor.\n"
+            "In the schema-defined function fallback, these scalars are tensorized to shape (B,H,L,S) "
+            "and the graph is inlined using only existing ONNX operators.",
+            AttributeProto::GRAPH,
+            OPTIONAL_VALUE)
         .Attr("mask_mod", "Optional mask modifier graph.", AttributeProto::GRAPH, OPTIONAL_VALUE)
         .Attr("prob_mod", "Optional probability modifier graph.", AttributeProto::GRAPH, OPTIONAL_VALUE)
         .TypeConstraint("T1", OpSchema::all_float_types_ir4(), "Constrain Q and K inputs types to float tensors.")
-        .TypeConstraint("T2", OpSchema::all_float_types_ir4(), "Constrain V input types to float tensors.")
         .TypeAndShapeInferenceFunction(FlexAttentionShapeInference)
         .SetSupportLevel(OpSchema::SupportType::EXPERIMENTAL)
         .SetNodeDeterminism(OpSchema::NodeDeterminism::Deterministic)
         .SetContextDependentFunctionBodyBuilder([](const FunctionBodyBuildContext& ctx,
                                                    const OpSchema& schema,
                                                    FunctionProto& functionProto) {
+          int64_t int_type = ONNX_NAMESPACE::TensorProto_DataType_INT64;
           int64_t float_type = ONNX_NAMESPACE::TensorProto_DataType_FLOAT;
 
           // Get input types
@@ -369,16 +373,20 @@ ONNX_PREVIEW_OPERATOR_SET_SCHEMA(
               (softmax_precision != ONNX_NAMESPACE::TensorProto_DataType_BFLOAT16) &&
               (softmax_precision != ONNX_NAMESPACE::TensorProto_DataType_FLOAT16) &&
               (softmax_precision != ONNX_NAMESPACE::TensorProto_DataType_DOUBLE)) {
-            return false;
+            return false; // Error
           }
 
+          // gqa not supported in this builder
           if (ctx.getAttribute("enable_gqa") != nullptr && ctx.getAttribute("enable_gqa")->i() != 0) {
             return false;
           }
 
-          // Provide a dense, no-modifier reference path only when graph attributes and extra inputs are absent.
-          if (ctx.getAttribute("score_mod") != nullptr || ctx.getAttribute("mask_mod") != nullptr ||
-              ctx.getAttribute("prob_mod") != nullptr) {
+          auto* score_mod_attr = ctx.getAttribute("score_mod");
+          auto* mask_mod_attr = ctx.getAttribute("mask_mod");
+          auto* prob_mod_attr = ctx.getAttribute("prob_mod");
+
+          // Only support score_mod for now
+          if (mask_mod_attr != nullptr || prob_mod_attr != nullptr) {
             return false;
           }
 
@@ -447,9 +455,55 @@ ONNX_PREVIEW_OPERATOR_SET_SCHEMA(
               .Add("KScaled = Mul(KTranspose, ScaleFactorF)")
               .Add("Score = MatMul(QScaled, KScaled)")
               .Add("ScoreCast = Cast (Score)", "to", T1)
-              .Add("SoftmaxCast = Cast (Score)", "to", softmax_precision)
-              .Add("Prob = Softmax <axis = 3> (SoftmaxCast)")
-              .Add("Y = MatMul (Prob, V)");
+              .Add("SoftmaxCast = Cast (Score)", "to", softmax_precision);
+
+          // Apply score_mod if provided
+          if (score_mod_attr != nullptr) {
+            const auto& g = score_mod_attr->g();
+
+            // ★ Empty graph (i.e., identity) is not inlined; skip to Identity case below
+            const bool is_empty = (g.node_size() == 0);
+            const bool same_io =
+                (g.input_size() >= 1 && g.output_size() >= 1 && g.input(0).name() == g.output(0).name());
+            if (is_empty && same_io) {
+              builder.Add("ScoreAfterMod = Identity(SoftmaxCast)");
+            } else {
+              // ScoreShape is (B,H,L,S)
+              builder.Add("B = Shape <start = 0, end = 1> (SoftmaxCast)")
+                  .Add("H = Shape <start = 1, end = 2> (SoftmaxCast)")
+                  .Add("L = Shape <start = 2, end = 3> (SoftmaxCast)")
+                  .Add("S = Shape <start = 3, end = 4> (SoftmaxCast)")
+                  .Add("Target = Concat <axis = 0> (B, H, L, S)");
+
+              // b/h/q/k index grids (int64)
+              builder.Add("b = Range (Zero1D, B, One1D)")
+                  .Add("ShapeB111 = Concat <axis = 0> (B, One1D, One1D, One1D)")
+                  .Add("b4 = Reshape (b, ShapeB111)")
+                  .Add("BatchIdx = Expand (b4, Target)")
+                  .Add("h = Range (Zero1D, H, One1D)")
+                  .Add("Shape1H11 = Concat <axis = 0> (One1D, H, One1D, One1D)")
+                  .Add("h4 = Reshape (h, Shape1H11)")
+                  .Add("HeadIdx = Expand (h4, Target)")
+                  .Add("q = Range (Zero1D, L, One1D)")
+                  .Add("Shape11L1 = Concat <axis = 0> (One1D, One1D, L, One1D)")
+                  .Add("q4 = Reshape (q, Shape11L1)")
+                  .Add("QIdx = Expand (q4, Target)")
+                  .Add("k = Range (Zero1D, S, One1D)")
+                  .Add("Shape111S = Concat <axis = 0> (One1D, One1D, One1D, S)")
+                  .Add("k4 = Reshape (k, Shape111S)")
+                  .Add("KIdx = Expand (k4, Target)");
+
+              builder.AddInlinedCall(
+                  {"ScoreAfterMod"},
+                  score_mod_attr->g(),
+                  {"SoftmaxCast", "BatchIdx", "HeadIdx", "QIdx", "KIdx"},
+                  "SM_");
+            }
+          } else {
+            builder.Add("ScoreAfterMod = Identity(SoftmaxCast)");
+          }
+
+          builder.Add("Prob = Softmax <axis = 3> (ScoreAfterMod)").Add("Y = MatMul (Prob, V)");
 
           schema.BuildFunction(functionProto);
           return true;
