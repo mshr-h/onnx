@@ -41,6 +41,20 @@ static void ValidateFlexAttentionGraph(
     fail_shape_inference("Attribute ", attr_name, " must have exactly one output.");
   }
 
+  // If the graph declares type for its first input (score/prob), validate elem type too.
+  if (expected_output_elem_type.has_value() && expected_inputs >= 5 && g.input(0).has_type()) {
+    const auto& in0 = g.input(0).type();
+    if (in0.has_tensor_type()) {
+      const auto in0_et = in0.tensor_type().elem_type();
+      if (in0_et != expected_output_elem_type.value()) {
+        fail_shape_inference(
+            "Attribute ", attr_name,
+            " input(0) element type does not match expected type. Expected ",
+            expected_output_elem_type.value(), ", got ", in0_et, ".");
+      }
+    }
+  }
+
   if (g.output_size() == 1 && g.output(0).has_type()) {
     const auto& type = g.output(0).type();
     if (!type.has_tensor_type()) {
@@ -150,9 +164,23 @@ static void FlexAttentionShapeInference(InferenceContext& ctx) {
     mergeInDimensionInfo(k_shape.dim(1), *output_shape->mutable_dim(1), 1);
   }
 
-  ValidateFlexAttentionGraph(ctx, ctx.getAttribute("score_mod"), 5, "score_mod", q_elem_type, true);
+  // score_mod/prob_mod run at Softmax input precision in the function fallback:
+  // SoftmaxCast = Cast(Score, to=softmax_precision) and then score_mod is applied on SoftmaxCast.
+  int32_t softmax_elem_type = q_elem_type;
+  if (const auto* sp = ctx.getAttribute("softmax_precision")) {
+    softmax_elem_type = static_cast<int32_t>(sp->i());
+    // Keep this aligned with builder's allowed set (or tighten as desired).
+    if (softmax_elem_type != TensorProto::FLOAT &&
+        softmax_elem_type != TensorProto::FLOAT16 &&
+        softmax_elem_type != TensorProto::BFLOAT16 &&
+        softmax_elem_type != TensorProto::DOUBLE) {
+      fail_type_inference("softmax_precision must be one of float/float16/bfloat16/double.");
+    }
+  }
+
+  ValidateFlexAttentionGraph(ctx, ctx.getAttribute("score_mod"), 5, "score_mod", softmax_elem_type, true);
   ValidateFlexAttentionGraph(ctx, ctx.getAttribute("mask_mod"), 4, "mask_mod", TensorProto::BOOL, true);
-  ValidateFlexAttentionGraph(ctx, ctx.getAttribute("prob_mod"), 5, "prob_mod", q_elem_type, true);
+  ValidateFlexAttentionGraph(ctx, ctx.getAttribute("prob_mod"), 5, "prob_mod", softmax_elem_type, true);
 }
 
 ONNX_PREVIEW_OPERATOR_SET_SCHEMA(
