@@ -38,8 +38,10 @@ Outputs
 Attributes
 ----------
 scale : FLOAT (optional)
-  Multiplicative scaling applied to raw dot-product scores prior to score_mod/mask/softmax.
-  If omitted, exporters SHOULD set it explicitly to avoid ambiguity across implementations.
+  Scaling factor applied to raw dot-product scores prior to score_mod/mask/softmax.
+  If omitted, the default is 1/sqrt(head_size), matching ONNX Attention / SDPA conventions.
+  For numerical stability, implementations may scale Q and K by sqrt(scale) before MatMul
+  (so that the score matrix is scaled by scale overall).
 
 enable_gqa : INT (default = 0)
   If 0: requires Hq == Hkv.
@@ -123,7 +125,7 @@ Head mapping:
 
 For each b in [0,B), hq in [0,Hq), q in [0,L), kv in [0,S):
   raw = dot(Q[b,hq,q,:], K[b,kvh,kv,:])
-  s   = (raw * scale) if scale provided else raw
+  s   = raw * (scale if provided else 1/sqrt(E))
   if score_mod provided:
       s = score_mod(s, b, hq, q, kv)
   if mask_mod provided:
@@ -249,6 +251,7 @@ static void FlexAttentionShapeInference(InferenceContext& ctx) {
     fail_shape_inference("Query and key must share the same embedding dimension.");
   }
 
+  // Validate enable_gqa attribute.
   const auto enable_gqa = getAttribute(ctx, "enable_gqa", 0);
   if (enable_gqa == 0) {
     if (q_shape.dim(1).has_dim_value() && k_shape.dim(1).has_dim_value() &&
@@ -262,6 +265,13 @@ static void FlexAttentionShapeInference(InferenceContext& ctx) {
       if (hkv <= 0 || (hq % hkv) != 0) {
         fail_shape_inference("enable_gqa=1 requires Hq to be divisible by Hkv.");
       }
+    }
+  }
+
+  // Validate scale attribute.
+  if (const auto* scale_attr = ctx.getAttribute("scale")) {
+    if (scale_attr->has_f() && !(scale_attr->f() > 0.0f)) {
+      fail_shape_inference("scale must be > 0 when provided.");
     }
   }
 
@@ -318,7 +328,8 @@ ONNX_PREVIEW_OPERATOR_SET_SCHEMA(
             "T1")
         .Attr(
             "scale",
-            "Multiplicative scaling applied to raw dot-product scores prior to modifiers and softmax.",
+            "Scaling factor applied to Q*K^T. Default value is 1/sqrt(head_size) when omitted. "
+            "For numerical stability, implementations may scale Q and K by sqrt(scale) before MatMul.",
             AttributeProto::FLOAT,
             OPTIONAL_VALUE)
         .Attr(
@@ -503,7 +514,14 @@ ONNX_PREVIEW_OPERATOR_SET_SCHEMA(
             builder.Add("ScoreAfterMod = Identity(SoftmaxCast)");
           }
 
-          builder.Add("Prob = Softmax <axis = 3> (ScoreAfterMod)").Add("Y = MatMul (Prob, V)");
+          builder.Add("Prob = Softmax <axis = 3> (ScoreAfterMod)");
+          if (softmax_precision != T1) {
+            builder.Add("VSp = Cast (VReshaped)", "to", softmax_precision);
+            builder.Add("YSp = MatMul (Prob, VSp)");
+            builder.Add("Y = Cast (YSp)", "to", T1);
+          } else {
+            builder.Add("Y = MatMul (Prob, VReshaped)");
+          }
 
           schema.BuildFunction(functionProto);
           return true;
