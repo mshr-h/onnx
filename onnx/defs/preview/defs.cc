@@ -11,11 +11,19 @@
 namespace ONNX_NAMESPACE {
 
 static constexpr const char* FlexAttention_ver1_doc = R"DOC(
-Computes scaled dot-product attention with user-provided customization subgraphs
-at up to three stages:
+Computes scaled dot-product attention over rank-4 (batched, multi-head) inputs,
+with optional user-provided customization subgraphs at up to three stages:
   (1) score_mod: modify each scalar attention score after Q·K^T
   (2) mask_mod : determine which (q_idx, k_idx) connections are allowed
   (3) prob_mod : modify each scalar probability after Softmax
+
+Inputs MUST be rank-4 tensors with shapes:
+  Q: (batch_size, q_num_heads, q_sequence_length, head_size)
+  K: (batch_size, kv_num_heads, kv_sequence_length, head_size)
+  V: (batch_size, kv_num_heads, kv_sequence_length, v_head_size)
+
+The output has shape:
+  Y: (batch_size, q_num_heads, q_sequence_length, v_head_size)
 )DOC";
 
 static void ValidateFlexAttentionGraph(
@@ -106,7 +114,9 @@ static void FlexAttentionShapeInference(InferenceContext& ctx) {
   const auto& k_shape = k_type->tensor_type().shape();
   const auto& v_shape = v_type->tensor_type().shape();
   if (q_shape.dim_size() != 4 || k_shape.dim_size() != 4 || v_shape.dim_size() != 4) {
-    fail_shape_inference("FlexAttention requires rank-4 inputs with shape (B, H, L, D).");
+    fail_shape_inference(
+        "FlexAttention requires rank-4 inputs: "
+        "Q (B, Hq, L, Dqk), K (B, Hkv, S, Dqk), V (B, Hkv, S, Dv).");
   }
 
   // Validate head sizes between K and V.
@@ -191,30 +201,26 @@ ONNX_PREVIEW_OPERATOR_SET_SCHEMA(
         .Input(
             0,
             "Q",
-            "Query tensor. "
-            "4D tensor with shape `(batch_size, q_num_heads, q_sequence_length, head_size)` or 3D tensor with shape `(batch_size, q_sequence_length, q_hidden_size)`. "
-            "For cases with a 3D input tensor, `q_hidden_size = q_num_heads * head_size`",
+            "Query tensor. 4D tensor with shape "
+            "`(batch_size, q_num_heads, q_sequence_length, head_size)`.",
             "T1")
         .Input(
             1,
             "K",
-            "Key tensor. "
-            "4D tensor with shape `(batch_size, kv_num_heads, kv_sequence_length, head_size)` or 3D tensor with shape `(batch_size, kv_sequence_length, k_hidden_size)`. "
-            "For cases with a 3D input tensor, `k_hidden_size = kv_num_heads * head_size`",
+            "Key tensor. 4D tensor with shape "
+            "`(batch_size, kv_num_heads, kv_sequence_length, head_size)`.",
             "T1")
         .Input(
             2,
             "V",
-            "Value tensor. "
-            "4D tensor with shape `(batch_size, kv_num_heads, kv_sequence_length, v_head_size)` or 3D tensor with shape `(batch_size, kv_sequence_length, v_hidden_size)`. "
-            "For cases with a 3D input tensor, `v_hidden_size = kv_num_heads * v_head_size`",
+            "Value tensor. 4D tensor with shape "
+            "`(batch_size, kv_num_heads, kv_sequence_length, v_head_size)`.",
             "T1")
         .Output(
             0,
             "Y",
-            "The output tensor . "
-            "4D tensor with shape `(batch_size, q_num_heads, q_sequence_length, v_head_size)` or 3D tensor with shape `(batch_size, q_sequence_length, hidden_size)`. "
-            "For cases with a 3D input tensor, `hidden_size = q_num_heads * v_head_size`",
+            "The output tensor. 4D tensor with shape "
+            "`(batch_size, q_num_heads, q_sequence_length, v_head_size)`.",
             "T1")
         .Attr(
             "scale",
