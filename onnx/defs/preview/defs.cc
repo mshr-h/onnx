@@ -3,6 +3,7 @@
  */
 
 #include <optional>
+#include <unordered_set>
 
 #include "onnx/defs/function.h"
 #include "onnx/defs/schema.h"
@@ -25,6 +26,73 @@ Inputs MUST be rank-4 tensors with shapes:
 The output has shape:
   Y: (batch_size, q_num_heads, q_sequence_length, v_head_size)
 )DOC";
+
+// Find the last node index that produces any of the given value-names.
+static int FindLastProducerIndex(const FunctionProto& fp, const std::vector<std::string>& values) {
+  std::unordered_set<std::string> set(values.begin(), values.end());
+  int last = -1;
+  for (int i = 0; i < fp.node_size(); ++i) {
+    for (const auto& out : fp.node(i).output()) {
+      if (set.count(out)) {
+        last = std::max(last, i);
+        break;
+      }
+    }
+  }
+  return last;
+}
+
+// Insert a node at position `index` in functionProto.node().
+static void InsertNodeAt(FunctionProto& fp, const NodeProto& n, int index) {
+  auto* nodes = fp.mutable_node();
+  nodes->Add()->CopyFrom(n); // append
+  int cur = nodes->size() - 1;
+  while (cur > index) {
+    nodes->SwapElements(cur, cur - 1);
+    --cur;
+  }
+}
+
+// Minimal inliner for GraphProto (attribute graphs) into another GraphProto.
+// - Maps subgraph input/output value-names to caller-provided names using io_map.
+// - Prefixes all other value names (node outputs, initializers, intermediate values) with `prefix`
+//   to avoid collisions.
+// Notes:
+// - Assumes no nested subgraphs inside node attributes (OK for typical score_mod graphs).
+// - Copies initializers; does not copy value_info (not required for execution).
+static void InlineGraphInto(
+    GraphProto* dst,
+    const GraphProto& src,
+    const std::unordered_map<std::string, std::string>& io_map,
+    const std::string& prefix) {
+  auto map_name = [&](const std::string& n) -> std::string {
+    if (n.empty())
+      return n;
+    auto it = io_map.find(n);
+    if (it != io_map.end())
+      return it->second;
+    return prefix + n;
+  };
+
+  // Copy initializers
+  for (const auto& init : src.initializer()) {
+    TensorProto* ni = dst->add_initializer();
+    *ni = init;
+    ni->set_name(map_name(init.name()));
+  }
+
+  // Copy nodes, remapping inputs/outputs
+  for (const auto& n : src.node()) {
+    NodeProto* nn = dst->add_node();
+    *nn = n;
+    nn->clear_input();
+    nn->clear_output();
+    for (const auto& in : n.input())
+      nn->add_input(map_name(in));
+    for (const auto& out : n.output())
+      nn->add_output(map_name(out));
+  }
+}
 
 static void ValidateFlexAttentionModGraph(
     InferenceContext& ctx,
@@ -49,16 +117,56 @@ static void ValidateFlexAttentionModGraph(
     fail_shape_inference("Attribute ", attr_name, " must have exactly one output.");
   }
 
-  // If the graph declares type for its first input (score/prob), validate elem type too.
-  if (expected_output_elem_type.has_value() && expected_inputs >= 5 && g.input(0).has_type()) {
-    const auto& in0 = g.input(0).type();
-    if (in0.has_tensor_type()) {
-      const auto in0_et = in0.tensor_type().elem_type();
-      if (in0_et != expected_output_elem_type.value()) {
-        fail_shape_inference(
-            "Attribute ", attr_name,
-            " input(0) element type does not match expected type. Expected ",
-            expected_output_elem_type.value(), ", got ", in0_et, ".");
+  auto check_scalar_tensor_if_typed = [&](const ValueInfoProto& vi, const char* what) {
+    if (!vi.has_type())
+      return;
+    const auto& tp = vi.type();
+    if (!tp.has_tensor_type()) {
+      fail_shape_inference("Attribute ", attr_name, " ", what, " must be a tensor type if typed.");
+    }
+    const auto& tt = tp.tensor_type();
+    if (tt.has_shape() && tt.shape().dim_size() != 0) {
+      fail_shape_inference("Attribute ", attr_name, " ", what, " must be a scalar tensor.");
+    }
+  };
+
+  auto check_elem_type_if_typed = [&](const ValueInfoProto& vi, int32_t et, const char* what) {
+    if (!vi.has_type())
+      return;
+    const auto& tp = vi.type();
+    if (!tp.has_tensor_type())
+      return;
+    const auto& tt = tp.tensor_type();
+    if (tt.elem_type() != et) {
+      fail_shape_inference(
+          "Attribute ", attr_name, " ", what, " element type mismatch. Expected ", et, ", got ", tt.elem_type(), ".");
+    }
+  };
+
+  // Inputs: enforce scalar-ness if typed.
+  for (int i = 0; i < g.input_size(); ++i) {
+    check_scalar_tensor_if_typed(g.input(i), ("input(" + std::to_string(i) + ")").c_str());
+  }
+
+  // Typed element-type checks (best-effort):
+  // - score_mod/prob_mod: input(0) and output are softmax_precision
+  // - mask_mod: output is bool
+  if (expected_output_elem_type.has_value()) {
+    // score/prob first input
+    if (expected_inputs >= 5 && g.input_size() >= 1) {
+      check_elem_type_if_typed(g.input(0), expected_output_elem_type.value(), "input(0)");
+    }
+    // indices (batch, head, q_idx, k_idx) are int64 for score_mod/prob_mod
+    if (expected_inputs >= 5) {
+      for (int i = 1; i < static_cast<int>(expected_inputs) && i < g.input_size(); ++i) {
+        check_elem_type_if_typed(g.input(i), TensorProto::INT64, ("input(" + std::to_string(i) + ")").c_str());
+      }
+    }
+  } else {
+    // mask_mod indices are int64
+    if (expected_inputs == 4) {
+      for (int i = 0; i < 4 && i < g.input_size(); ++i) {
+        check_elem_type_if_typed(g.input(i), TensorProto::INT64, ("input(" + std::to_string(i) + ")").c_str());
       }
     }
   }
@@ -173,10 +281,8 @@ static void FlexAttentionShapeInference(InferenceContext& ctx) {
   if (const auto* sp = ctx.getAttribute("softmax_precision")) {
     softmax_elem_type = static_cast<int32_t>(sp->i());
     // Keep this aligned with builder's allowed set (or tighten as desired).
-    if (softmax_elem_type != TensorProto::FLOAT &&
-        softmax_elem_type != TensorProto::FLOAT16 &&
-        softmax_elem_type != TensorProto::BFLOAT16 &&
-        softmax_elem_type != TensorProto::DOUBLE) {
+    if (softmax_elem_type != TensorProto::FLOAT && softmax_elem_type != TensorProto::FLOAT16 &&
+        softmax_elem_type != TensorProto::BFLOAT16 && softmax_elem_type != TensorProto::DOUBLE) {
       fail_type_inference("softmax_precision must be one of float/float16/bfloat16/double.");
     }
   }
@@ -243,13 +349,29 @@ ONNX_PREVIEW_OPERATOR_SET_SCHEMA(
             "The graph MUST have exactly 5 inputs in this exact order:\n"
             "  (score, batch, head, q_idx, k_idx)\n"
             "and exactly 1 output (score_out).\n"
-            "All five inputs are scalar tensors; the output is a scalar tensor.\n"
-            "In the schema-defined function fallback, these scalars are tensorized to shape (B,H,L,S) "
-            "and the graph is inlined using only existing ONNX operators.",
+            "All five inputs are scalar tensors (0-D). The output is a scalar tensor (0-D).\n"
+            "batch/head/q_idx/k_idx are INT64 scalars; score is a scalar of softmax_precision (or input type when omitted).",
             AttributeProto::GRAPH,
             OPTIONAL_VALUE)
-        .Attr("mask_mod", "Optional mask modifier graph.", AttributeProto::GRAPH, OPTIONAL_VALUE)
-        .Attr("prob_mod", "Optional probability modifier graph.", AttributeProto::GRAPH, OPTIONAL_VALUE)
+        .Attr(
+            "mask_mod",
+            "Optional mask modifier graph.\n"
+            "The graph MUST have exactly 4 inputs in this exact order:\n"
+            "  (batch, head, q_idx, k_idx)\n"
+            "and exactly 1 output (mask_out).\n"
+            "All inputs are INT64 scalar tensors (0-D). mask_out is a BOOL scalar tensor (0-D).",
+            AttributeProto::GRAPH,
+            OPTIONAL_VALUE)
+        .Attr(
+            "prob_mod",
+            "Optional probability modifier graph.\n"
+            "The graph MUST have exactly 5 inputs in this exact order:\n"
+            "  (prob, batch, head, q_idx, k_idx)\n"
+            "and exactly 1 output (prob_out).\n"
+            "All five inputs are scalar tensors (0-D). The output is a scalar tensor (0-D).\n"
+            "batch/head/q_idx/k_idx are INT64 scalars; prob is a scalar of softmax_precision (or input type when omitted).",
+            AttributeProto::GRAPH,
+            OPTIONAL_VALUE)
         .TypeConstraint("T1", OpSchema::all_float_types_ir4(), "Constrain Q and K inputs types to float tensors.")
         .TypeAndShapeInferenceFunction(FlexAttentionShapeInference)
         .SetSupportLevel(OpSchema::SupportType::EXPERIMENTAL)
@@ -257,7 +379,6 @@ ONNX_PREVIEW_OPERATOR_SET_SCHEMA(
         .SetContextDependentFunctionBodyBuilder([](const FunctionBodyBuildContext& ctx,
                                                    const OpSchema& schema,
                                                    FunctionProto& functionProto) {
-          int64_t int_type = ONNX_NAMESPACE::TensorProto_DataType_INT64;
           int64_t float_type = ONNX_NAMESPACE::TensorProto_DataType_FLOAT;
 
           // Get input types
@@ -273,7 +394,7 @@ ONNX_PREVIEW_OPERATOR_SET_SCHEMA(
               (softmax_precision != ONNX_NAMESPACE::TensorProto_DataType_BFLOAT16) &&
               (softmax_precision != ONNX_NAMESPACE::TensorProto_DataType_FLOAT16) &&
               (softmax_precision != ONNX_NAMESPACE::TensorProto_DataType_DOUBLE)) {
-            return false; // Error
+            return false;
           }
 
           // gqa not supported in this builder
@@ -285,10 +406,9 @@ ONNX_PREVIEW_OPERATOR_SET_SCHEMA(
           auto* mask_mod_attr = ctx.getAttribute("mask_mod");
           auto* prob_mod_attr = ctx.getAttribute("prob_mod");
 
-          // Only support score_mod for now
-          if (mask_mod_attr != nullptr || prob_mod_attr != nullptr) {
+          // prob_mod not supported in this builder yet
+          if (prob_mod_attr != nullptr)
             return false;
-          }
 
           const auto* q_type = ctx.getInputType(0);
           const auto* k_type = ctx.getInputType(1);
@@ -303,26 +423,48 @@ ONNX_PREVIEW_OPERATOR_SET_SCHEMA(
             return false;
           }
 
-          FunctionBuilder builder(functionProto);
-          builder
-              .Add("BatchSize = Shape <start = 0, end = 1> (Q)") // batch size
-              .Add("QSeqLen = Shape <start = -2, end = -1> (Q)") // q_sequence_length
-              .Add("KVSeqLen = Shape <start = -2, end = -1> (K)"); // kv_sequence_length
-
-          // For 4D inputs: Already in desired shape [batch_size, num_heads, seq_length, head_size]
-          builder.Add("QReshaped = Identity(Q)").Add("KReshaped = Identity(K)").Add("VReshaped = Identity(V)");
-
-          builder
-              .Add("QNumHeads = Shape <start = 1, end = 2> (QReshaped)") // q_num_heads
-              .Add("KVNumHeads = Shape <start = 1, end = 2> (KReshaped)"); // kv_num_heads
-
-          // Calculate scaling factor if scale attribute not provided
+          // Scale attribute
           auto scale_attr = ctx.getAttribute("scale");
           float scale = (scale_attr != nullptr) ? scale_attr->f() : static_cast<float>(1);
-          builder
-              .Add("QKHeadSize = Shape <start = 3, end = 4> (QReshaped)") // head_size for Q and K
+
+          // mask_value (float attr) -> cast to softmax_precision for Where
+          auto mask_value_attr = ctx.getAttribute("mask_value");
+          float mask_value = (mask_value_attr != nullptr) ? mask_value_attr->f() : -3.402823466e+38f;
+
+          // Decide whether score_mod is a trivial identity graph.
+          bool score_mod_is_trivial_identity = false;
+          if (score_mod_attr != nullptr) {
+            const auto& sg = score_mod_attr->g();
+            const bool is_empty = (sg.node_size() == 0);
+            const bool same_io =
+                (sg.input_size() >= 1 && sg.output_size() >= 1 && sg.input(0).name() == sg.output(0).name());
+            score_mod_is_trivial_identity = (is_empty && same_io);
+          }
+
+          // We'll build Loop nodes as local NodeProto and insert them after schema.BuildFunction(),
+          // to keep topological order (builder nodes are materialized by BuildFunction at the end).
+          bool need_score_loop = (score_mod_attr != nullptr && !score_mod_is_trivial_identity);
+          bool need_mask_loop = (mask_mod_attr != nullptr);
+
+          NodeProto score_loop_node;
+          NodeProto mask_loop_node;
+
+          FunctionBuilder builder(functionProto);
+
+          // (These Shape nodes are unused in current fallback; keeping them is OK but optional)
+          builder.Add("BatchSize = Shape <start = 0, end = 1> (Q)")
+              .Add("QSeqLen = Shape <start = -2, end = -1> (Q)")
+              .Add("KVSeqLen = Shape <start = -2, end = -1> (K)");
+
+          // For 4D inputs: Already in desired shape [B,H,seq,head]
+          builder.Add("QReshaped = Identity(Q)").Add("KReshaped = Identity(K)").Add("VReshaped = Identity(V)");
+
+          builder.Add("QNumHeads = Shape <start = 1, end = 2> (QReshaped)")
+              .Add("KVNumHeads = Shape <start = 1, end = 2> (KReshaped)");
+
+          // Calculate scaling factor if scale attribute not provided
+          builder.Add("QKHeadSize = Shape <start = 3, end = 4> (QReshaped)")
               .Add("QKHeadSizeF = Cast (QKHeadSize)", "to", float_type)
-              .Add("VHeadSize = Shape <start = 3, end = 4> (VReshaped)") // head_size for V
               .Add("SqrtHeadSize = Sqrt(QKHeadSizeF)")
               .Const1D("One1D", static_cast<int64_t>(1))
               .Const1D("NegOne1D", static_cast<int64_t>(-1))
@@ -330,79 +472,257 @@ ONNX_PREVIEW_OPERATOR_SET_SCHEMA(
               .Const1D("Zero1D", static_cast<int64_t>(0))
               .Add("CalculatedScale = Div(One1DF, SqrtHeadSize)")
               .Const("ScaleF", ToTensor<float>(scale))
-              .Add(scale_attr != nullptr ? "ScaleFactorF32 = Identity(ScaleF)"
-                                         : "ScaleFactorF32 = Identity(CalculatedScale)");
+              .Add(
+                  scale_attr != nullptr ? "ScaleFactorF32 = Identity(ScaleF)"
+                                        : "ScaleFactorF32 = Identity(CalculatedScale)");
 
-          // TODO: Add score_mod, mask_mod, prob_mod support here
-          // The following pattern is applied
-          //      Q          K          V
-          //      |          |          |
-          //     Q*scale    K*scale     |
-          //      |          |          |
-          //      |       Transpose     |
-          //      |          |          |
-          //      ---MatMul---          |
-          //            |               |
-          //            |               |
-          //         Softmax            |
-          //            |               |
-          //            -----MatMul------
-          //                    |
-          //                    Y
-          builder
-              .Add("KTranspose = Transpose <perm = [0, 1, 3, 2]> (KReshaped)")
+          builder.Add("KTranspose = Transpose <perm = [0, 1, 3, 2]> (KReshaped)")
               .Add("Score = MatMul(QReshaped, KTranspose)")
               .Add("ScoreSp = Cast (Score)", "to", softmax_precision)
               .Add("ScaleSp = Cast (ScaleFactorF32)", "to", softmax_precision)
               .Add("SoftmaxCast = Mul(ScoreSp, ScaleSp)");
 
-          // Apply score_mod if provided
-          if (score_mod_attr != nullptr) {
-            const auto& g = score_mod_attr->g();
-
-            // ★ Empty graph (i.e., identity) is not inlined; skip to Identity case below
-            const bool is_empty = (g.node_size() == 0);
-            const bool same_io =
-                (g.input_size() >= 1 && g.output_size() >= 1 && g.input(0).name() == g.output(0).name());
-            if (is_empty && same_io) {
-              builder.Add("ScoreAfterMod = Identity(SoftmaxCast)");
-            } else {
-              // ScoreShape is (B,H,L,S)
-              builder.Add("B = Shape <start = 0, end = 1> (SoftmaxCast)")
-                  .Add("H = Shape <start = 1, end = 2> (SoftmaxCast)")
-                  .Add("L = Shape <start = 2, end = 3> (SoftmaxCast)")
-                  .Add("S = Shape <start = 3, end = 4> (SoftmaxCast)")
-                  .Add("Target = Concat <axis = 0> (B, H, L, S)");
-
-              // b/h/q/k index grids (int64)
-              builder.Add("b = Range (Zero1D, B, One1D)")
-                  .Add("ShapeB111 = Concat <axis = 0> (B, One1D, One1D, One1D)")
-                  .Add("b4 = Reshape (b, ShapeB111)")
-                  .Add("BatchIdx = Expand (b4, Target)")
-                  .Add("h = Range (Zero1D, H, One1D)")
-                  .Add("Shape1H11 = Concat <axis = 0> (One1D, H, One1D, One1D)")
-                  .Add("h4 = Reshape (h, Shape1H11)")
-                  .Add("HeadIdx = Expand (h4, Target)")
-                  .Add("q = Range (Zero1D, L, One1D)")
-                  .Add("Shape11L1 = Concat <axis = 0> (One1D, One1D, L, One1D)")
-                  .Add("q4 = Reshape (q, Shape11L1)")
-                  .Add("QIdx = Expand (q4, Target)")
-                  .Add("k = Range (Zero1D, S, One1D)")
-                  .Add("Shape111S = Concat <axis = 0> (One1D, One1D, One1D, S)")
-                  .Add("k4 = Reshape (k, Shape111S)")
-                  .Add("KIdx = Expand (k4, Target)");
-
-              builder.AddInlinedCall(
-                  {"ScoreAfterMod"},
-                  score_mod_attr->g(),
-                  {"SoftmaxCast", "BatchIdx", "HeadIdx", "QIdx", "KIdx"},
-                  "SM_");
-            }
-          } else {
-            builder.Add("ScoreAfterMod = Identity(SoftmaxCast)");
+          // Common scalars for scalar-contract Loops (build once if either loop is needed)
+          if (need_score_loop || need_mask_loop) {
+            builder.Add("ScoreShape = Shape(SoftmaxCast)")
+                .Const("Idx0", ToTensor<int64_t>(0))
+                .Const("Idx1", ToTensor<int64_t>(1))
+                .Const("Idx2", ToTensor<int64_t>(2))
+                .Const("Idx3", ToTensor<int64_t>(3))
+                .Add("B = Gather <axis = 0> (ScoreShape, Idx0)")
+                .Add("H = Gather <axis = 0> (ScoreShape, Idx1)")
+                .Add("L = Gather <axis = 0> (ScoreShape, Idx2)")
+                .Add("S = Gather <axis = 0> (ScoreShape, Idx3)")
+                .Add("ScoreFlat = Reshape(SoftmaxCast, NegOne1D)")
+                .Add("N = Size(ScoreFlat)")
+                .Const("TrueI64", ToTensor<int64_t>(1))
+                .Add("CondInit = Cast(TrueI64)", "to", static_cast<int64_t>(TensorProto::BOOL));
           }
 
-          builder.Add("Prob = Softmax <axis = 3> (ScoreAfterMod)");
+          // ----- score_mod (scalar-contract Loop) -----
+          if (need_score_loop) {
+            const auto& sg = score_mod_attr->g();
+
+            // Build Loop node locally (do NOT add to functionProto yet).
+            score_loop_node.Clear();
+            score_loop_node.set_op_type("Loop");
+            score_loop_node.add_input("N");
+            score_loop_node.add_input("CondInit");
+            score_loop_node.add_output("ScoreModFlat");
+
+            AttributeProto* body_attr = score_loop_node.add_attribute();
+            body_attr->set_name("body");
+            body_attr->set_type(AttributeProto::GRAPH);
+            GraphProto* body = body_attr->mutable_g();
+            body->set_name("FlexAttention_score_mod_body");
+
+            // Body I/O
+            body->add_input()->set_name("iter"); // INT64 scalar
+            body->add_input()->set_name("cond_in"); // BOOL scalar
+            body->add_output()->set_name("cond_out");
+            body->add_output()->set_name("scan_out");
+
+            // k = iter % S
+            {
+              auto* n = body->add_node();
+              n->set_op_type("Mod");
+              n->add_input("iter");
+              n->add_input("S");
+              n->add_output("k_idx");
+            }
+            // t1 = iter / S
+            {
+              auto* n = body->add_node();
+              n->set_op_type("Div");
+              n->add_input("iter");
+              n->add_input("S");
+              n->add_output("t1");
+            }
+            // q = t1 % L
+            {
+              auto* n = body->add_node();
+              n->set_op_type("Mod");
+              n->add_input("t1");
+              n->add_input("L");
+              n->add_output("q_idx");
+            }
+            // t2 = t1 / L
+            {
+              auto* n = body->add_node();
+              n->set_op_type("Div");
+              n->add_input("t1");
+              n->add_input("L");
+              n->add_output("t2");
+            }
+            // head = t2 % H
+            {
+              auto* n = body->add_node();
+              n->set_op_type("Mod");
+              n->add_input("t2");
+              n->add_input("H");
+              n->add_output("head");
+            }
+            // batch = t2 / H
+            {
+              auto* n = body->add_node();
+              n->set_op_type("Div");
+              n->add_input("t2");
+              n->add_input("H");
+              n->add_output("batch");
+            }
+
+            // score_i = Gather(ScoreFlat, iter, axis=0)  -> scalar (0-D)
+            {
+              auto* n = body->add_node();
+              n->set_op_type("Gather");
+              n->add_input("ScoreFlat");
+              n->add_input("iter");
+              n->add_output("score_i");
+              auto* a = n->add_attribute();
+              a->set_name("axis");
+              a->set_type(AttributeProto::INT);
+              a->set_i(0);
+            }
+
+            // Inline score_mod graph into body (scalar contract)
+            {
+              std::unordered_map<std::string, std::string> io_map;
+              io_map.emplace(sg.input(0).name(), "score_i");
+              io_map.emplace(sg.input(1).name(), "batch");
+              io_map.emplace(sg.input(2).name(), "head");
+              io_map.emplace(sg.input(3).name(), "q_idx");
+              io_map.emplace(sg.input(4).name(), "k_idx");
+              io_map.emplace(sg.output(0).name(), "score_mod_out");
+              InlineGraphInto(body, sg, io_map, "SM_");
+            }
+
+            // cond_out = cond_in
+            {
+              auto* n = body->add_node();
+              n->set_op_type("Identity");
+              n->add_input("cond_in");
+              n->add_output("cond_out");
+            }
+            // scan_out = score_mod_out
+            {
+              auto* n = body->add_node();
+              n->set_op_type("Identity");
+              n->add_input("score_mod_out");
+              n->add_output("scan_out");
+            }
+
+            // Reshape scan output [N] back to (B,H,L,S).
+            builder.Add("ScoreAfterScoreMod = Reshape(ScoreModFlat, ScoreShape)");
+          } else {
+            builder.Add("ScoreAfterScoreMod = Identity(SoftmaxCast)");
+          }
+
+          // ----- mask_mod (scalar-contract Loop) -----
+          if (need_mask_loop) {
+            const auto& mg = mask_mod_attr->g();
+
+            // Build Loop node locally (do NOT add to functionProto yet).
+            mask_loop_node.Clear();
+            mask_loop_node.set_op_type("Loop");
+            mask_loop_node.add_input("N");
+            mask_loop_node.add_input("CondInit");
+            mask_loop_node.add_output("MaskFlat");
+
+            AttributeProto* mbody_attr = mask_loop_node.add_attribute();
+            mbody_attr->set_name("body");
+            mbody_attr->set_type(AttributeProto::GRAPH);
+            GraphProto* mbody = mbody_attr->mutable_g();
+            mbody->set_name("FlexAttention_mask_mod_body");
+
+            // Body I/O
+            mbody->add_input()->set_name("iter");
+            mbody->add_input()->set_name("cond_in");
+            mbody->add_output()->set_name("cond_out");
+            mbody->add_output()->set_name("scan_out");
+
+            // Same index math as score_mod
+            {
+              auto* n = mbody->add_node();
+              n->set_op_type("Mod");
+              n->add_input("iter");
+              n->add_input("S");
+              n->add_output("k_idx");
+            }
+            {
+              auto* n = mbody->add_node();
+              n->set_op_type("Div");
+              n->add_input("iter");
+              n->add_input("S");
+              n->add_output("t1");
+            }
+            {
+              auto* n = mbody->add_node();
+              n->set_op_type("Mod");
+              n->add_input("t1");
+              n->add_input("L");
+              n->add_output("q_idx");
+            }
+            {
+              auto* n = mbody->add_node();
+              n->set_op_type("Div");
+              n->add_input("t1");
+              n->add_input("L");
+              n->add_output("t2");
+            }
+            {
+              auto* n = mbody->add_node();
+              n->set_op_type("Mod");
+              n->add_input("t2");
+              n->add_input("H");
+              n->add_output("head");
+            }
+            {
+              auto* n = mbody->add_node();
+              n->set_op_type("Div");
+              n->add_input("t2");
+              n->add_input("H");
+              n->add_output("batch");
+            }
+
+            // Inline mask_mod graph into body (scalar contract)
+            {
+              std::unordered_map<std::string, std::string> io_map;
+              io_map.emplace(mg.input(0).name(), "batch");
+              io_map.emplace(mg.input(1).name(), "head");
+              io_map.emplace(mg.input(2).name(), "q_idx");
+              io_map.emplace(mg.input(3).name(), "k_idx");
+              io_map.emplace(mg.output(0).name(), "mask_mod_out");
+              InlineGraphInto(mbody, mg, io_map, "MM_");
+            }
+
+            // cond_out = cond_in
+            {
+              auto* n = mbody->add_node();
+              n->set_op_type("Identity");
+              n->add_input("cond_in");
+              n->add_output("cond_out");
+            }
+            // scan_out = mask_mod_out
+            {
+              auto* n = mbody->add_node();
+              n->set_op_type("Identity");
+              n->add_input("mask_mod_out");
+              n->add_output("scan_out");
+            }
+
+            // Mask = Reshape(MaskFlat, ScoreShape)
+            builder.Add("Mask = Reshape(MaskFlat, ScoreShape)");
+            // MaskValueSp = Cast(Const(mask_value), to=softmax_precision)
+            builder.Const("MaskValueF", ToTensor<float>(mask_value))
+                .Add("MaskValueSp = Cast (MaskValueF)", "to", softmax_precision);
+            // ScoreAfterMask = Where(Mask, ScoreAfterScoreMod, MaskValueSp)
+            builder.Add("ScoreAfterMask = Where (Mask, ScoreAfterScoreMod, MaskValueSp)");
+          } else {
+            builder.Add("ScoreAfterMask = Identity(ScoreAfterScoreMod)");
+          }
+
+          builder.Add("Prob = Softmax <axis = 3> (ScoreAfterMask)");
+
           if (softmax_precision != T1) {
             builder.Add("VSp = Cast (VReshaped)", "to", softmax_precision);
             builder.Add("YSp = MatMul (Prob, VSp)");
@@ -412,6 +732,22 @@ ONNX_PREVIEW_OPERATOR_SET_SCHEMA(
           }
 
           schema.BuildFunction(functionProto);
+
+          // Insert score loop after its captured scalars/inputs are defined.
+          if (need_score_loop) {
+            int last = FindLastProducerIndex(functionProto, {"ScoreFlat", "N", "CondInit", "B", "H", "L", "S"});
+            int insert_at = (last >= 0) ? (last + 1) : 0;
+            InsertNodeAt(functionProto, score_loop_node, insert_at);
+          }
+
+          // Insert mask loop after its captured scalars/inputs are defined.
+          // If both loops exist, we recompute after score insertion so ordering stays valid.
+          if (need_mask_loop) {
+            int last = FindLastProducerIndex(functionProto, {"ScoreFlat", "N", "CondInit", "B", "H", "L", "S"});
+            int insert_at = (last >= 0) ? (last + 1) : 0;
+            InsertNodeAt(functionProto, mask_loop_node, insert_at);
+          }
+
           return true;
         }));
 } // namespace ONNX_NAMESPACE
