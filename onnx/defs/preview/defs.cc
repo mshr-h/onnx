@@ -143,6 +143,8 @@ static void ValidateFlexAttentionModGraph(
     }
   };
 
+  const bool is_mask_mod = (expected_inputs == 4);
+
   // Inputs: enforce scalar-ness if typed.
   for (int i = 0; i < g.input_size(); ++i) {
     check_scalar_tensor_if_typed(g.input(i), ("input(" + std::to_string(i) + ")").c_str());
@@ -152,14 +154,21 @@ static void ValidateFlexAttentionModGraph(
   // - score_mod/prob_mod: input(0) and output are softmax_precision
   // - mask_mod: output is bool
   if (expected_output_elem_type.has_value()) {
-    // score/prob first input
-    if (expected_inputs >= 5 && g.input_size() >= 1) {
-      check_elem_type_if_typed(g.input(0), expected_output_elem_type.value(), "input(0)");
-    }
-    // indices (batch, head, q_idx, k_idx) are int64 for score_mod/prob_mod
-    if (expected_inputs >= 5) {
-      for (int i = 1; i < static_cast<int>(expected_inputs) && i < g.input_size(); ++i) {
+    if (is_mask_mod) {
+      // mask_mod indices are int64
+      for (int i = 0; i < 4 && i < g.input_size(); ++i) {
         check_elem_type_if_typed(g.input(i), TensorProto::INT64, ("input(" + std::to_string(i) + ")").c_str());
+      }
+    } else {
+      // score/prob first input
+      if (expected_inputs >= 5 && g.input_size() >= 1) {
+        check_elem_type_if_typed(g.input(0), expected_output_elem_type.value(), "input(0)");
+      }
+      // indices (batch, head, q_idx, k_idx) are int64 for score_mod/prob_mod
+      if (expected_inputs >= 5) {
+        for (int i = 1; i < static_cast<int>(expected_inputs) && i < g.input_size(); ++i) {
+          check_elem_type_if_typed(g.input(i), TensorProto::INT64, ("input(" + std::to_string(i) + ")").c_str());
+        }
       }
     }
   } else {
@@ -372,7 +381,7 @@ ONNX_PREVIEW_OPERATOR_SET_SCHEMA(
             "batch/head/q_idx/k_idx are INT64 scalars; prob is a scalar of softmax_precision (or input type when omitted).",
             AttributeProto::GRAPH,
             OPTIONAL_VALUE)
-        .TypeConstraint("T1", OpSchema::all_float_types_ir4(), "Constrain Q and K inputs types to float tensors.")
+        .TypeConstraint("T1", OpSchema::all_float_types_ir4(), "Constrain Q, K and V inputs types to float tensors.")
         .TypeAndShapeInferenceFunction(FlexAttentionShapeInference)
         .SetSupportLevel(OpSchema::SupportType::EXPERIMENTAL)
         .SetNodeDeterminism(OpSchema::NodeDeterminism::Deterministic)
@@ -471,7 +480,11 @@ ONNX_PREVIEW_OPERATOR_SET_SCHEMA(
               .Add("KVNumHeads = Shape <start = 1, end = 2> (KReshaped)");
 
           // Calculate scaling factor if scale attribute not provided
-          builder.Add("QKHeadSize = Shape <start = 3, end = 4> (QReshaped)")
+          // Keep scale as 0-D scalar in both paths (explicit scale and calculated default)
+          builder
+              .Add("QShapeAll = Shape(QReshaped)")
+              .Const("Idx3Head", ToTensor<int64_t>(3))
+              .Add("QKHeadSize = Gather <axis = 0> (QShapeAll, Idx3Head)")
               .Add("QKHeadSizeF = Cast (QKHeadSize)", "to", float_type)
               .Add("SqrtHeadSize = Sqrt(QKHeadSizeF)")
               .Const1D("One1D", static_cast<int64_t>(1))
@@ -734,6 +747,9 @@ ONNX_PREVIEW_OPERATOR_SET_SCHEMA(
           if (need_prob_loop) {
             const auto& pg = prob_mod_attr->g();
 
+            // Flatten probabilities to 1-D for scalar-contract Loop.
+            builder.Add("ProbFlat = Reshape(Prob, NegOne1D)");
+
             prob_loop_node.Clear();
             prob_loop_node.set_op_type("Loop");
             prob_loop_node.add_input("N");
@@ -840,6 +856,8 @@ ONNX_PREVIEW_OPERATOR_SET_SCHEMA(
               n->add_input("prob_mod_out");
               n->add_output("scan_out");
             }
+            // Reshape scan output [N] back to (B,H,L,S).
+            builder.Add("ProbAfterProbMod = Reshape(ProbModFlat, ScoreShape)");
           } else {
             builder.Add("ProbAfterProbMod = Identity(Prob)");
           }
