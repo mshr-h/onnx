@@ -406,10 +406,8 @@ ONNX_PREVIEW_OPERATOR_SET_SCHEMA(
             return false;
           }
 
-          // gqa not supported in this builder
-          if (ctx.getAttribute("enable_gqa") != nullptr && ctx.getAttribute("enable_gqa")->i() != 0) {
-            return false;
-          }
+          const bool enable_gqa =
+              (ctx.getAttribute("enable_gqa") != nullptr && ctx.getAttribute("enable_gqa")->i() != 0);
 
           auto* score_mod_attr = ctx.getAttribute("score_mod");
           auto* mask_mod_attr = ctx.getAttribute("mask_mod");
@@ -502,6 +500,17 @@ ONNX_PREVIEW_OPERATOR_SET_SCHEMA(
           builder.Add("QNumHeads = Shape <start = 1, end = 2> (QReshaped)")
               .Add("KVNumHeads = Shape <start = 1, end = 2> (KReshaped)");
 
+          // If enable_gqa=1, replicate K/V heads to match the query head dimension.
+          if (enable_gqa) {
+            builder.Const1D("OneI64Vec", static_cast<int64_t>(1))
+                .Add("KVRepeat = Div (QNumHeads, KVNumHeads)")
+                .Add("Repeats = Concat <axis = 0> (OneI64Vec, KVRepeat, OneI64Vec, OneI64Vec)")
+                .Add("KAligned = Tile (KReshaped, Repeats)")
+                .Add("VAligned = Tile (VReshaped, Repeats)");
+          } else {
+            builder.Add("KAligned = Identity(KReshaped)").Add("VAligned = Identity(VReshaped)");
+          }
+
           // Calculate scaling factor if scale attribute not provided
           // Keep scale as 0-D scalar in both paths (explicit scale and calculated default)
           builder
@@ -518,7 +527,7 @@ ONNX_PREVIEW_OPERATOR_SET_SCHEMA(
                   scale_attr != nullptr ? "ScaleFactorF32 = Identity(ScaleF)"
                                         : "ScaleFactorF32 = Identity(CalculatedScale)");
 
-          builder.Add("KTranspose = Transpose <perm = [0, 1, 3, 2]> (KReshaped)")
+            builder.Add("KTranspose = Transpose <perm = [0, 1, 3, 2]> (KAligned)")
               .Add("Score = MatMul(QReshaped, KTranspose)")
               .Add("ScoreSp = Cast (Score)", "to", softmax_precision)
               .Add("ScaleSp = Cast (ScaleFactorF32)", "to", softmax_precision)
@@ -884,11 +893,11 @@ ONNX_PREVIEW_OPERATOR_SET_SCHEMA(
           }
 
           if (softmax_precision != T1) {
-            builder.Add("VSp = Cast (VReshaped)", "to", softmax_precision);
+            builder.Add("VSp = Cast (VAligned)", "to", softmax_precision);
             builder.Add("YSp = MatMul (ProbAfterProbMod, VSp)");
             builder.Add("Y = Cast (YSp)", "to", T1);
           } else {
-            builder.Add("Y = MatMul (ProbAfterProbMod, VReshaped)");
+            builder.Add("Y = MatMul (ProbAfterProbMod, VAligned)");
           }
 
           schema.BuildFunction(functionProto);
