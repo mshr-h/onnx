@@ -418,8 +418,7 @@ ONNX_PREVIEW_OPERATOR_SET_SCHEMA(
           // Validate modifier subgraphs in builder as well (avoid OOB / segfault if model is malformed
           // or shape-inference is not executed before function building).
           auto validate_mod_graph = [&](const AttributeProto* attr,
-                                        int expected_inputs,
-                                        const char* name) -> bool {
+                                        int expected_inputs) -> bool {
             if (attr == nullptr)
               return true;
             if (!attr->has_g())
@@ -429,21 +428,14 @@ ONNX_PREVIEW_OPERATOR_SET_SCHEMA(
               return false;
             if (g.output_size() != 1)
               return false;
-            // Require named I/O (needed for name-based mapping during inlining/identity checks).
-            for (int i = 0; i < g.input_size(); ++i) {
-              if (g.input(i).name().empty())
-                return false;
-            }
-            if (g.output(0).name().empty())
-              return false;
             return true;
           };
 
-          if (!validate_mod_graph(score_mod_attr, 5, "score_mod"))
+          if (!validate_mod_graph(score_mod_attr, 5))
             return false;
-          if (!validate_mod_graph(mask_mod_attr, 4, "mask_mod"))
+          if (!validate_mod_graph(mask_mod_attr, 4))
             return false;
-          if (!validate_mod_graph(prob_mod_attr, 5, "prob_mod"))
+          if (!validate_mod_graph(prob_mod_attr, 5))
             return false;
 
           const auto* q_type = ctx.getInputType(0);
