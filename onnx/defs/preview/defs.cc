@@ -415,6 +415,37 @@ ONNX_PREVIEW_OPERATOR_SET_SCHEMA(
           auto* mask_mod_attr = ctx.getAttribute("mask_mod");
           auto* prob_mod_attr = ctx.getAttribute("prob_mod");
 
+          // Validate modifier subgraphs in builder as well (avoid OOB / segfault if model is malformed
+          // or shape-inference is not executed before function building).
+          auto validate_mod_graph = [&](const AttributeProto* attr,
+                                        int expected_inputs,
+                                        const char* name) -> bool {
+            if (attr == nullptr)
+              return true;
+            if (!attr->has_g())
+              return false;
+            const auto& g = attr->g();
+            if (g.input_size() != expected_inputs)
+              return false;
+            if (g.output_size() != 1)
+              return false;
+            // Require named I/O (needed for name-based mapping during inlining/identity checks).
+            for (int i = 0; i < g.input_size(); ++i) {
+              if (g.input(i).name().empty())
+                return false;
+            }
+            if (g.output(0).name().empty())
+              return false;
+            return true;
+          };
+
+          if (!validate_mod_graph(score_mod_attr, 5, "score_mod"))
+            return false;
+          if (!validate_mod_graph(mask_mod_attr, 4, "mask_mod"))
+            return false;
+          if (!validate_mod_graph(prob_mod_attr, 5, "prob_mod"))
+            return false;
+
           const auto* q_type = ctx.getInputType(0);
           const auto* k_type = ctx.getInputType(1);
           const auto* v_type = ctx.getInputType(2);
@@ -442,7 +473,7 @@ ONNX_PREVIEW_OPERATOR_SET_SCHEMA(
             const auto& sg = score_mod_attr->g();
             const bool is_empty = (sg.node_size() == 0);
             const bool same_io =
-                (sg.input_size() >= 1 && sg.output_size() >= 1 && sg.input(0).name() == sg.output(0).name());
+                (sg.input_size() == 5 && sg.output_size() == 1 && sg.input(0).name() == sg.output(0).name());
             score_mod_is_trivial_identity = (is_empty && same_io);
           }
 
@@ -452,7 +483,7 @@ ONNX_PREVIEW_OPERATOR_SET_SCHEMA(
             const auto& pg = prob_mod_attr->g();
             const bool is_empty = (pg.node_size() == 0);
             const bool same_io =
-                (pg.input_size() >= 1 && pg.output_size() >= 1 && pg.input(0).name() == pg.output(0).name());
+                (pg.input_size() == 5 && pg.output_size() == 1 && pg.input(0).name() == pg.output(0).name());
             prob_mod_is_trivial_identity = (is_empty && same_io);
           }
 
@@ -487,11 +518,9 @@ ONNX_PREVIEW_OPERATOR_SET_SCHEMA(
               .Add("QKHeadSize = Gather <axis = 0> (QShapeAll, Idx3Head)")
               .Add("QKHeadSizeF = Cast (QKHeadSize)", "to", float_type)
               .Add("SqrtHeadSize = Sqrt(QKHeadSizeF)")
-              .Const1D("One1D", static_cast<int64_t>(1))
               .Const1D("NegOne1D", static_cast<int64_t>(-1))
-              .Const1D("One1DF", static_cast<float>(1))
-              .Const1D("Zero1D", static_cast<int64_t>(0))
-              .Add("CalculatedScale = Div(One1DF, SqrtHeadSize)")
+              .Const("OneF", ToTensor<float>(1.0f))
+              .Add("CalculatedScale = Div(OneF, SqrtHeadSize)")
               .Const("ScaleF", ToTensor<float>(scale))
               .Add(
                   scale_attr != nullptr ? "ScaleFactorF32 = Identity(ScaleF)"
