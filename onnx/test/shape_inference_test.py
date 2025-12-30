@@ -7316,6 +7316,34 @@ class TestShapeInference(TestShapeInferenceHelper):
                 ],
             )
 
+    def test_flexattention_gqa_valid(self) -> None:
+        graph = self._make_graph(
+            [
+                ("Q", TensorProto.FLOAT, (2, 4, 8, 16)),
+                ("K", TensorProto.FLOAT, (2, 2, 10, 16)),
+                ("V", TensorProto.FLOAT, (2, 2, 10, 32)),
+            ],
+            [
+                make_node(
+                    "FlexAttention",
+                    ["Q", "K", "V"],
+                    ["Y"],
+                    domain=AI_ONNX_PREVIEW_DOMAIN,
+                    enable_gqa=1,
+                )
+            ],
+            [make_tensor_value_info("Y", TensorProto.FLOAT, (None, None, None, None))],
+        )
+
+        self._assert_inferred(
+            graph,
+            [make_tensor_value_info("Y", TensorProto.FLOAT, (2, 4, 8, 32))],
+            opset_imports=[
+                make_opsetid(ONNX_DOMAIN, 26),
+                make_opsetid(AI_ONNX_PREVIEW_DOMAIN, 1),
+            ],
+        )
+
     def test_flexattention_bad_mask_mod_output_type(self) -> None:
         mask_mod = helper.make_graph(
             [make_node("Identity", ["batch"], ["mask_out"])],
