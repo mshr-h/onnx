@@ -3,6 +3,7 @@
  */
 
 #include <optional>
+#include <functional>
 #include <unordered_set>
 
 #include "onnx/defs/function.h"
@@ -53,12 +54,80 @@ static void InsertNodeAt(FunctionProto& fp, const NodeProto& n, int index) {
   }
 }
 
+static void RemapGraphProtoNames(
+    GraphProto* g,
+    const std::function<std::string(const std::string&)>& map_name);
+
+static void RemapNodeProtoNames(
+    NodeProto* n,
+    const std::function<std::string(const std::string&)>& map_name) {
+  // Remap inputs/outputs
+  const auto old_inputs = n->input();
+  const auto old_outputs = n->output();
+  n->clear_input();
+  n->clear_output();
+  for (const auto& in : old_inputs)
+    n->add_input(map_name(in));
+  for (const auto& out : old_outputs)
+    n->add_output(map_name(out));
+
+  // Recursively remap attribute graphs (If/Loop/Scan/etc.).
+  for (int i = 0; i < n->attribute_size(); ++i) {
+    auto* attr = n->mutable_attribute(i);
+    if (attr->has_g()) {
+      RemapGraphProtoNames(attr->mutable_g(), map_name);
+    }
+    if (attr->graphs_size() > 0) {
+      for (int j = 0; j < attr->graphs_size(); ++j) {
+        RemapGraphProtoNames(attr->mutable_graphs(j), map_name);
+      }
+    }
+  }
+}
+
+static void RemapGraphProtoNames(
+    GraphProto* g,
+    const std::function<std::string(const std::string&)>& map_name) {
+  // Graph inputs/outputs/value_info
+  for (int i = 0; i < g->input_size(); ++i) {
+    g->mutable_input(i)->set_name(map_name(g->input(i).name()));
+  }
+  for (int i = 0; i < g->output_size(); ++i) {
+    g->mutable_output(i)->set_name(map_name(g->output(i).name()));
+  }
+  for (int i = 0; i < g->value_info_size(); ++i) {
+    g->mutable_value_info(i)->set_name(map_name(g->value_info(i).name()));
+  }
+
+  // Initializers
+  for (int i = 0; i < g->initializer_size(); ++i) {
+    g->mutable_initializer(i)->set_name(map_name(g->initializer(i).name()));
+  }
+  for (int i = 0; i < g->sparse_initializer_size(); ++i) {
+    auto* st = g->mutable_sparse_initializer(i);
+    // SparseTensorProto has no top-level "name"; the TensorProto "values" name serves as the
+    // initializer name when used in GraphProto::sparse_initializer.
+    if (st->has_values()) {
+      st->mutable_values()->set_name(map_name(st->values().name()));
+    }
+    if (st->has_indices()) {
+      st->mutable_indices()->set_name(map_name(st->indices().name()));
+    }
+  }
+
+  // Nodes
+  for (int i = 0; i < g->node_size(); ++i) {
+    RemapNodeProtoNames(g->mutable_node(i), map_name);
+  }
+}
+
 // Minimal inliner for GraphProto (attribute graphs) into another GraphProto.
 // - Maps subgraph input/output value-names to caller-provided names using io_map.
 // - Prefixes all other value names (node outputs, initializers, intermediate values) with `prefix`
 //   to avoid collisions.
 // Notes:
-// - Assumes no nested subgraphs inside node attributes (OK for typical score_mod graphs).
+// - Supports nested subgraphs inside node attributes (If/Loop/Scan/etc.) by recursively remapping
+//   AttributeProto::g/graphs GraphProto value-names.
 // - Copies initializers; does not copy value_info (not required for execution).
 static void InlineGraphInto(
     GraphProto* dst,
@@ -85,12 +154,7 @@ static void InlineGraphInto(
   for (const auto& n : src.node()) {
     NodeProto* nn = dst->add_node();
     *nn = n;
-    nn->clear_input();
-    nn->clear_output();
-    for (const auto& in : n.input())
-      nn->add_input(map_name(in));
-    for (const auto& out : n.output())
-      nn->add_output(map_name(out));
+    RemapNodeProtoNames(nn, map_name);
   }
 }
 
