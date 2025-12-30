@@ -406,10 +406,6 @@ ONNX_PREVIEW_OPERATOR_SET_SCHEMA(
           auto* mask_mod_attr = ctx.getAttribute("mask_mod");
           auto* prob_mod_attr = ctx.getAttribute("prob_mod");
 
-          // prob_mod not supported in this builder yet
-          if (prob_mod_attr != nullptr)
-            return false;
-
           const auto* q_type = ctx.getInputType(0);
           const auto* k_type = ctx.getInputType(1);
           const auto* v_type = ctx.getInputType(2);
@@ -441,13 +437,25 @@ ONNX_PREVIEW_OPERATOR_SET_SCHEMA(
             score_mod_is_trivial_identity = (is_empty && same_io);
           }
 
+          // Decide whether prob_mod is a trivial identity graph.
+          bool prob_mod_is_trivial_identity = false;
+          if (prob_mod_attr != nullptr) {
+            const auto& pg = prob_mod_attr->g();
+            const bool is_empty = (pg.node_size() == 0);
+            const bool same_io =
+                (pg.input_size() >= 1 && pg.output_size() >= 1 && pg.input(0).name() == pg.output(0).name());
+            prob_mod_is_trivial_identity = (is_empty && same_io);
+          }
+
           // We'll build Loop nodes as local NodeProto and insert them after schema.BuildFunction(),
           // to keep topological order (builder nodes are materialized by BuildFunction at the end).
           bool need_score_loop = (score_mod_attr != nullptr && !score_mod_is_trivial_identity);
           bool need_mask_loop = (mask_mod_attr != nullptr);
+          bool need_prob_loop = (prob_mod_attr != nullptr && !prob_mod_is_trivial_identity);
 
           NodeProto score_loop_node;
           NodeProto mask_loop_node;
+          NodeProto prob_loop_node;
 
           FunctionBuilder builder(functionProto);
 
@@ -483,7 +491,7 @@ ONNX_PREVIEW_OPERATOR_SET_SCHEMA(
               .Add("SoftmaxCast = Mul(ScoreSp, ScaleSp)");
 
           // Common scalars for scalar-contract Loops (build once if either loop is needed)
-          if (need_score_loop || need_mask_loop) {
+          if (need_score_loop || need_mask_loop || need_prob_loop) {
             builder.Add("ScoreShape = Shape(SoftmaxCast)")
                 .Const("Idx0", ToTensor<int64_t>(0))
                 .Const("Idx1", ToTensor<int64_t>(1))
@@ -723,12 +731,125 @@ ONNX_PREVIEW_OPERATOR_SET_SCHEMA(
 
           builder.Add("Prob = Softmax <axis = 3> (ScoreAfterMask)");
 
+          if (need_prob_loop) {
+            const auto& pg = prob_mod_attr->g();
+
+            prob_loop_node.Clear();
+            prob_loop_node.set_op_type("Loop");
+            prob_loop_node.add_input("N");
+            prob_loop_node.add_input("CondInit");
+            prob_loop_node.add_output("ProbModFlat");
+
+            AttributeProto* pbody_attr = prob_loop_node.add_attribute();
+            pbody_attr->set_name("body");
+            pbody_attr->set_type(AttributeProto::GRAPH);
+            GraphProto* pbody = pbody_attr->mutable_g();
+            pbody->set_name("FlexAttention_prob_mod_body");
+
+            // Body I/O
+            pbody->add_input()->set_name("iter");     // INT64 scalar
+            pbody->add_input()->set_name("cond_in");  // BOOL scalar
+            pbody->add_output()->set_name("cond_out");
+            pbody->add_output()->set_name("scan_out");
+
+            // k = iter % S
+            {
+              auto* n = pbody->add_node();
+              n->set_op_type("Mod");
+              n->add_input("iter");
+              n->add_input("S");
+              n->add_output("k_idx");
+            }
+            // t1 = iter / S
+            {
+              auto* n = pbody->add_node();
+              n->set_op_type("Div");
+              n->add_input("iter");
+              n->add_input("S");
+              n->add_output("t1");
+            }
+            // q = t1 % L
+            {
+              auto* n = pbody->add_node();
+              n->set_op_type("Mod");
+              n->add_input("t1");
+              n->add_input("L");
+              n->add_output("q_idx");
+            }
+            // t2 = t1 / L
+            {
+              auto* n = pbody->add_node();
+              n->set_op_type("Div");
+              n->add_input("t1");
+              n->add_input("L");
+              n->add_output("t2");
+            }
+            // head = t2 % H
+            {
+              auto* n = pbody->add_node();
+              n->set_op_type("Mod");
+              n->add_input("t2");
+              n->add_input("H");
+              n->add_output("head");
+            }
+            // batch = t2 / H
+            {
+              auto* n = pbody->add_node();
+              n->set_op_type("Div");
+              n->add_input("t2");
+              n->add_input("H");
+              n->add_output("batch");
+            }
+
+            // prob_i = Gather(ProbFlat, iter, axis=0)
+            {
+              auto* n = pbody->add_node();
+              n->set_op_type("Gather");
+              n->add_input("ProbFlat");
+              n->add_input("iter");
+              n->add_output("prob_i");
+              auto* a = n->add_attribute();
+              a->set_name("axis");
+              a->set_type(AttributeProto::INT);
+              a->set_i(0);
+            }
+
+            // Inline prob_mod graph
+            {
+              std::unordered_map<std::string, std::string> io_map;
+              io_map.emplace(pg.input(0).name(), "prob_i");
+              io_map.emplace(pg.input(1).name(), "batch");
+              io_map.emplace(pg.input(2).name(), "head");
+              io_map.emplace(pg.input(3).name(), "q_idx");
+              io_map.emplace(pg.input(4).name(), "k_idx");
+              io_map.emplace(pg.output(0).name(), "prob_mod_out");
+              InlineGraphInto(pbody, pg, io_map, "PM_");
+            }
+
+            // cond_out = cond_in
+            {
+              auto* n = pbody->add_node();
+              n->set_op_type("Identity");
+              n->add_input("cond_in");
+              n->add_output("cond_out");
+            }
+            // scan_out = prob_mod_out
+            {
+              auto* n = pbody->add_node();
+              n->set_op_type("Identity");
+              n->add_input("prob_mod_out");
+              n->add_output("scan_out");
+            }
+          } else {
+            builder.Add("ProbAfterProbMod = Identity(Prob)");
+          }
+
           if (softmax_precision != T1) {
             builder.Add("VSp = Cast (VReshaped)", "to", softmax_precision);
-            builder.Add("YSp = MatMul (Prob, VSp)");
+            builder.Add("YSp = MatMul (ProbAfterProbMod, VSp)");
             builder.Add("Y = Cast (YSp)", "to", T1);
           } else {
-            builder.Add("Y = MatMul (Prob, VReshaped)");
+            builder.Add("Y = MatMul (ProbAfterProbMod, VReshaped)");
           }
 
           schema.BuildFunction(functionProto);
@@ -746,6 +867,14 @@ ONNX_PREVIEW_OPERATOR_SET_SCHEMA(
             int last = FindLastProducerIndex(functionProto, {"ScoreFlat", "N", "CondInit", "B", "H", "L", "S"});
             int insert_at = (last >= 0) ? (last + 1) : 0;
             InsertNodeAt(functionProto, mask_loop_node, insert_at);
+          }
+
+          // Insert prob loop after its captured scalars/inputs are defined.
+          // If other loops exist, we recompute after prior insertions so ordering stays valid.
+          if (need_prob_loop) {
+            int last = FindLastProducerIndex(functionProto, {"ProbFlat", "N", "CondInit", "B", "H", "L", "S"});
+            int insert_at = (last >= 0) ? (last + 1) : 0;
+            InsertNodeAt(functionProto, prob_loop_node, insert_at);
           }
 
           return true;
