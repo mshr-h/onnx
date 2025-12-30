@@ -154,13 +154,6 @@ static void FlexAttentionShapeInference(InferenceContext& ctx) {
     }
   }
 
-  // Validate scale attribute.
-  if (const auto* scale_attr = ctx.getAttribute("scale")) {
-    if (scale_attr->has_f() && !(scale_attr->f() > 0.0f)) {
-      fail_shape_inference("scale must be > 0 when provided.");
-    }
-  }
-
   auto* output_shape = output_type->mutable_shape();
   output_shape->clear_dim();
   *output_shape->add_dim() = q_shape.dim(0);
@@ -337,9 +330,8 @@ ONNX_PREVIEW_OPERATOR_SET_SCHEMA(
               .Const1D("Zero1D", static_cast<int64_t>(0))
               .Add("CalculatedScale = Div(One1DF, SqrtHeadSize)")
               .Const("ScaleF", ToTensor<float>(scale))
-              .Add(scale_attr != nullptr ? "ScaleFactor = Identity(ScaleF)" : "ScaleFactor = Identity(CalculatedScale)")
-              .Add("ScaleFactorSqrt = Sqrt(ScaleFactor)")
-              .Add("ScaleFactorF = Cast (ScaleFactorSqrt)", "to", T1);
+              .Add(scale_attr != nullptr ? "ScaleFactorF32 = Identity(ScaleF)"
+                                         : "ScaleFactorF32 = Identity(CalculatedScale)");
 
           // TODO: Add score_mod, mask_mod, prob_mod support here
           // The following pattern is applied
@@ -357,11 +349,12 @@ ONNX_PREVIEW_OPERATOR_SET_SCHEMA(
           //            -----MatMul------
           //                    |
           //                    Y
-          builder.Add("KTranspose = Transpose <perm = [0, 1, 3, 2]> (KReshaped)")
-              .Add("QScaled = Mul(QReshaped, ScaleFactorF)")
-              .Add("KScaled = Mul(KTranspose, ScaleFactorF)")
-              .Add("Score = MatMul(QScaled, KScaled)")
-              .Add("SoftmaxCast = Cast (Score)", "to", softmax_precision);
+          builder
+              .Add("KTranspose = Transpose <perm = [0, 1, 3, 2]> (KReshaped)")
+              .Add("Score = MatMul(QReshaped, KTranspose)")
+              .Add("ScoreSp = Cast (Score)", "to", softmax_precision)
+              .Add("ScaleSp = Cast (ScaleFactorF32)", "to", softmax_precision)
+              .Add("SoftmaxCast = Mul(ScoreSp, ScaleSp)");
 
           // Apply score_mod if provided
           if (score_mod_attr != nullptr) {
