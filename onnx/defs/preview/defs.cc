@@ -26,7 +26,7 @@ The output has shape:
   Y: (batch_size, q_num_heads, q_sequence_length, v_head_size)
 )DOC";
 
-static void ValidateFlexAttentionGraph(
+static void ValidateFlexAttentionModGraph(
     InferenceContext& ctx,
     const AttributeProto* attr,
     size_t expected_inputs,
@@ -188,9 +188,9 @@ static void FlexAttentionShapeInference(InferenceContext& ctx) {
     }
   }
 
-  ValidateFlexAttentionGraph(ctx, ctx.getAttribute("score_mod"), 5, "score_mod", softmax_elem_type, true);
-  ValidateFlexAttentionGraph(ctx, ctx.getAttribute("mask_mod"), 4, "mask_mod", TensorProto::BOOL, true);
-  ValidateFlexAttentionGraph(ctx, ctx.getAttribute("prob_mod"), 5, "prob_mod", softmax_elem_type, true);
+  ValidateFlexAttentionModGraph(ctx, ctx.getAttribute("score_mod"), 5, "score_mod", softmax_elem_type, true);
+  ValidateFlexAttentionModGraph(ctx, ctx.getAttribute("mask_mod"), 4, "mask_mod", TensorProto::BOOL, true);
+  ValidateFlexAttentionModGraph(ctx, ctx.getAttribute("prob_mod"), 5, "prob_mod", softmax_elem_type, true);
 }
 
 ONNX_PREVIEW_OPERATOR_SET_SCHEMA(
@@ -247,7 +247,7 @@ ONNX_PREVIEW_OPERATOR_SET_SCHEMA(
         .Attr(
             "score_mod",
             "Optional score modifier graph.\n"
-            "The graph MUST have exactly 5 inputs in this exact order and names:\n"
+            "The graph MUST have exactly 5 inputs in this exact order:\n"
             "  (score, batch, head, q_idx, k_idx)\n"
             "and exactly 1 output (score_out).\n"
             "All five inputs are scalar tensors; the output is a scalar tensor.\n"
@@ -361,7 +361,6 @@ ONNX_PREVIEW_OPERATOR_SET_SCHEMA(
               .Add("QScaled = Mul(QReshaped, ScaleFactorF)")
               .Add("KScaled = Mul(KTranspose, ScaleFactorF)")
               .Add("Score = MatMul(QScaled, KScaled)")
-              .Add("ScoreCast = Cast (Score)", "to", T1)
               .Add("SoftmaxCast = Cast (Score)", "to", softmax_precision);
 
           // Apply score_mod if provided
