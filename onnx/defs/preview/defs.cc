@@ -362,16 +362,20 @@ static void FlexAttentionShapeInference(InferenceContext& ctx) {
     mergeInDimensionInfo(k_shape.dim(1), *output_shape->mutable_dim(1), 1);
   }
 
-  // score_mod/prob_mod run at Softmax input precision in the function fallback:
-  // SoftmaxCast = Cast(Score, to=softmax_precision) and then score_mod is applied on SoftmaxCast.
+  // score_mod/prob_mod run at Softmax precision in the function fallback.
+  // PyTorch-like default: for float16/bfloat16 inputs, softmax computations default to float.
   int32_t softmax_elem_type = q_elem_type;
   if (const auto* sp = ctx.getAttribute("softmax_precision")) {
     softmax_elem_type = static_cast<int32_t>(sp->i());
-    // Keep this aligned with builder's allowed set (or tighten as desired).
-    if (softmax_elem_type != TensorProto::FLOAT && softmax_elem_type != TensorProto::FLOAT16 &&
-        softmax_elem_type != TensorProto::BFLOAT16 && softmax_elem_type != TensorProto::DOUBLE) {
-      fail_type_inference("softmax_precision must be one of float/float16/bfloat16/double.");
+  } else {
+    if (softmax_elem_type == TensorProto::FLOAT16 || softmax_elem_type == TensorProto::BFLOAT16) {
+      softmax_elem_type = TensorProto::FLOAT;
     }
+  }
+  // Keep this aligned with builder's allowed set.
+  if (softmax_elem_type != TensorProto::FLOAT && softmax_elem_type != TensorProto::FLOAT16 &&
+      softmax_elem_type != TensorProto::BFLOAT16 && softmax_elem_type != TensorProto::DOUBLE) {
+    fail_type_inference("softmax_precision must be specified when inputs are not float/float16/bfloat16/double.");
   }
 
   ValidateFlexAttentionModGraph(ctx, ctx.getAttribute("score_mod"), 5, "score_mod", softmax_elem_type, true);
@@ -417,7 +421,9 @@ ONNX_PREVIEW_OPERATOR_SET_SCHEMA(
         .Attr(
             "softmax_precision",
             "The floating-point precision used in softmax computation. "
-            "If softmax precision is not provided, the same precision as the input of softmax (Q and K) is used.",
+            "If softmax precision is not provided, the default is: float for float16/bfloat16 inputs, otherwise the "
+            "same precision as the input of softmax (Q and K). If Q/K/V are not float/float16/bfloat16/double, "
+            "softmax_precision must be specified.",
             AttributeProto::INT,
             OPTIONAL_VALUE)
         .Attr(
@@ -437,7 +443,7 @@ ONNX_PREVIEW_OPERATOR_SET_SCHEMA(
             "  (score, batch, head, q_idx, k_idx)\n"
             "and exactly 1 output (score_out).\n"
             "All five inputs are scalar tensors (0-D). The output is a scalar tensor (0-D).\n"
-            "batch/head/q_idx/k_idx are INT64 scalars; score is a scalar of softmax_precision (or input type when omitted).",
+            "batch/head/q_idx/k_idx are INT64 scalars; score is a scalar of softmax_precision (or default precision when omitted).",
             AttributeProto::GRAPH,
             OPTIONAL_VALUE)
         .Attr(
@@ -456,7 +462,7 @@ ONNX_PREVIEW_OPERATOR_SET_SCHEMA(
             "  (prob, batch, head, q_idx, k_idx)\n"
             "and exactly 1 output (prob_out).\n"
             "All five inputs are scalar tensors (0-D). The output is a scalar tensor (0-D).\n"
-            "batch/head/q_idx/k_idx are INT64 scalars; prob is a scalar of softmax_precision (or input type when omitted).",
+            "batch/head/q_idx/k_idx are INT64 scalars; prob is a scalar of softmax_precision (or default precision when omitted).",
             AttributeProto::GRAPH,
             OPTIONAL_VALUE)
         .TypeConstraint("T1", OpSchema::all_float_types_ir4(), "Constrain Q, K and V inputs types to float tensors.")
@@ -476,7 +482,18 @@ ONNX_PREVIEW_OPERATOR_SET_SCHEMA(
 
           // Determine precision types for Softmax
           auto softmax_precision_attr = ctx.getAttribute("softmax_precision");
-          int64_t softmax_precision = (softmax_precision_attr != nullptr) ? softmax_precision_attr->i() : T1;
+          int64_t softmax_precision;
+          if (softmax_precision_attr != nullptr) {
+            softmax_precision = softmax_precision_attr->i();
+          } else {
+            // PyTorch-like default: for float16/bfloat16 inputs, compute softmax in float.
+            if (T1 == ONNX_NAMESPACE::TensorProto_DataType_FLOAT16 ||
+                T1 == ONNX_NAMESPACE::TensorProto_DataType_BFLOAT16) {
+              softmax_precision = ONNX_NAMESPACE::TensorProto_DataType_FLOAT;
+            } else {
+              softmax_precision = T1;
+            }
+          }
           if ((softmax_precision != ONNX_NAMESPACE::TensorProto_DataType_FLOAT) &&
               (softmax_precision != ONNX_NAMESPACE::TensorProto_DataType_BFLOAT16) &&
               (softmax_precision != ONNX_NAMESPACE::TensorProto_DataType_FLOAT16) &&
@@ -607,9 +624,11 @@ ONNX_PREVIEW_OPERATOR_SET_SCHEMA(
 
             builder.Add("KTranspose = Transpose <perm = [0, 1, 3, 2]> (KAligned)")
               .Add("Score = MatMul(QReshaped, KTranspose)")
-              .Add("ScoreSp = Cast (Score)", "to", softmax_precision)
-              .Add("ScaleSp = Cast (ScaleFactorF32)", "to", softmax_precision)
-              .Add("SoftmaxCast = Mul(ScoreSp, ScaleSp)");
+              // Apply scale to the attention logits before score_mod/mask_mod/softmax.
+              // For PyTorch-like numerics, do the multiplication in float32 (float_type) first.
+              .Add("ScoreF = Cast (Score)", "to", float_type)
+              .Add("SoftmaxCastF = Mul(ScoreF, ScaleFactorF32)")
+              .Add("SoftmaxCast = Cast (SoftmaxCastF)", "to", softmax_precision);
 
           // Common scalars for scalar-contract Loops (build once if either loop is needed)
           if (need_score_loop || need_mask_loop || need_prob_loop) {
