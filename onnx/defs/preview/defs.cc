@@ -150,6 +150,20 @@ static void InlineGraphInto(
     ni->set_name(map_name(init.name()));
   }
 
+  // Copy sparse initializers
+  for (const auto& s_init : src.sparse_initializer()) {
+    SparseTensorProto* ns = dst->add_sparse_initializer();
+    *ns = s_init;
+    // SparseTensorProto has no top-level "name"; TensorProto "values" name serves as the
+    // initializer name when used in GraphProto::sparse_initializer.
+    if (ns->has_values()) {
+      ns->mutable_values()->set_name(map_name(ns->values().name()));
+    }
+    if (ns->has_indices()) {
+      ns->mutable_indices()->set_name(map_name(ns->indices().name()));
+    }
+  }
+
   // Copy nodes, remapping inputs/outputs
   for (const auto& n : src.node()) {
     NodeProto* nn = dst->add_node();
