@@ -7238,7 +7238,7 @@ class TestShapeInference(TestShapeInferenceHelper):
             outputs,
         )
 
-    def test_flexattention_basic_shape_and_graph_attrs(self) -> None:
+    def test_flexattention_basic(self) -> None:
         score_mod = self._make_mod_graph(
             "score_mod", TensorProto.FLOAT, include_score_input=True, output_type=TensorProto.FLOAT
         )
@@ -7261,8 +7261,8 @@ class TestShapeInference(TestShapeInferenceHelper):
         graph = self._make_graph(
             [
                 ("Q", TensorProto.FLOAT, (2, 4, 8, 16)),
-                ("K", TensorProto.FLOAT, (2, 4, 8, 16)),
-                ("V", TensorProto.FLOAT, (2, 4, 8, 32)),
+                ("K", TensorProto.FLOAT, (2, 4, 10, 16)),
+                ("V", TensorProto.FLOAT, (2, 4, 10, 32)),
             ],
             [
                 make_node(
