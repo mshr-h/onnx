@@ -54,10 +54,6 @@ static void InsertNodeAt(FunctionProto& fp, const NodeProto& n, int index) {
   }
 }
 
-static void RemapGraphProtoNames(
-    GraphProto* g,
-    const std::function<std::string(const std::string&)>& map_name);
-
 static void RemapNodeProtoNames(
     NodeProto* n,
     const std::function<std::string(const std::string&)>& map_name) {
@@ -597,11 +593,28 @@ ONNX_PREVIEW_OPERATOR_SET_SCHEMA(
 
           // If enable_gqa=1, replicate K/V heads to match the query head dimension.
           if (enable_gqa) {
-            builder.Const1D("OneI64Vec", static_cast<int64_t>(1))
+            // NOTE: Use repeat-interleave semantics, not Tile.
+            // Tile would produce interleaved heads [k0,k1,k0,k1,...], but GQA expects
+            // kvh = hq // group, i.e., [k0,k0,k1,k1,...].
+            builder
                 .Add("KVRepeat = Div (QNumHeads, KVNumHeads)")
-                .Add("Repeats = Concat <axis = 0> (OneI64Vec, KVRepeat, OneI64Vec, OneI64Vec)")
-                .Add("KAligned = Tile (KReshaped, Repeats)")
-                .Add("VAligned = Tile (VReshaped, Repeats)");
+                .Const1D("Axis2", static_cast<int64_t>(2))
+                // K: [B, Hkv, S, E] -> [B, Hkv, 1, S, E]
+                .Add("KUnsqueezed = Unsqueeze(KReshaped, Axis2)")
+                .Add("KHeadSize1D = Shape <start = 3, end = 4> (KReshaped)")
+                // Expand to [B, Hkv, group, S, E]
+                .Add("KExpandShape = Concat <axis = 0> (BatchSize, KVNumHeads, KVRepeat, KVSeqLen, KHeadSize1D)")
+                .Add("KExpanded = Expand(KUnsqueezed, KExpandShape)")
+                // Reshape to [B, Hq, S, E] where Hq = Hkv * group
+                .Add("KAlignedShape = Concat <axis = 0> (BatchSize, QNumHeads, KVSeqLen, KHeadSize1D)")
+                .Add("KAligned = Reshape(KExpanded, KAlignedShape)")
+                // V: [B, Hkv, S, Ev] -> [B, Hkv, 1, S, Ev]
+                .Add("VUnsqueezed = Unsqueeze(VReshaped, Axis2)")
+                .Add("VHeadSize1D = Shape <start = 3, end = 4> (VReshaped)")
+                .Add("VExpandShape = Concat <axis = 0> (BatchSize, KVNumHeads, KVRepeat, KVSeqLen, VHeadSize1D)")
+                .Add("VExpanded = Expand(VUnsqueezed, VExpandShape)")
+                .Add("VAlignedShape = Concat <axis = 0> (BatchSize, QNumHeads, KVSeqLen, VHeadSize1D)")
+                .Add("VAligned = Reshape(VExpanded, VAlignedShape)");
           } else {
             builder.Add("KAligned = Identity(KReshaped)").Add("VAligned = Identity(VReshaped)");
           }
