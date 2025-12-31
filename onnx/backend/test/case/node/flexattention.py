@@ -120,6 +120,7 @@ class FlexAttention(Base):
             outputs=[Y],
             name="test_flexattention",
             opset_imports=[
+                helper.make_opsetid("", 26),
                 helper.make_opsetid(AI_ONNX_PREVIEW_DOMAIN, 1),
             ],
         )
@@ -151,6 +152,7 @@ class FlexAttention(Base):
             outputs=[Y],
             name="test_flexattention_scaled",
             opset_imports=[
+                helper.make_opsetid("", 26),
                 helper.make_opsetid(AI_ONNX_PREVIEW_DOMAIN, 1),
             ],
         )
@@ -180,6 +182,7 @@ class FlexAttention(Base):
             outputs=[Y],
             name="test_flexattention_gqa",
             opset_imports=[
+                helper.make_opsetid("", 26),
                 helper.make_opsetid(AI_ONNX_PREVIEW_DOMAIN, 1),
             ],
         )
@@ -209,6 +212,7 @@ class FlexAttention(Base):
             outputs=[Y],
             name="test_flexattention_diff_head_sizes",
             opset_imports=[
+                helper.make_opsetid("", 26),
                 helper.make_opsetid(AI_ONNX_PREVIEW_DOMAIN, 1),
             ],
         )
@@ -251,6 +255,7 @@ class FlexAttention(Base):
             outputs=[Y],
             name="test_flexattention_score_mod",
             opset_imports=[
+                helper.make_opsetid("", 26),
                 helper.make_opsetid(AI_ONNX_PREVIEW_DOMAIN, 1),
             ],
         )
@@ -295,6 +300,7 @@ class FlexAttention(Base):
             outputs=[Y],
             name="test_flexattention_mask_mod_causal",
             opset_imports=[
+                helper.make_opsetid("", 26),
                 helper.make_opsetid(AI_ONNX_PREVIEW_DOMAIN, 1),
             ],
         )
@@ -324,6 +330,7 @@ class FlexAttention(Base):
             outputs=[Y],
             name="test_flexattention_fp16",
             opset_imports=[
+                helper.make_opsetid("", 26),
                 helper.make_opsetid(AI_ONNX_PREVIEW_DOMAIN, 1),
             ],
         )
@@ -353,6 +360,7 @@ class FlexAttention(Base):
             outputs=[Y],
             name="test_flexattention_double",
             opset_imports=[
+                helper.make_opsetid("", 26),
                 helper.make_opsetid(AI_ONNX_PREVIEW_DOMAIN, 1),
             ],
         )
