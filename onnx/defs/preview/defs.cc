@@ -55,6 +55,10 @@ Y = Probs @ V
 Grouped Query Attention (GQA):
 When `enable_gqa=1`, supports GQA where `q_num_heads` is a multiple of `kv_num_heads`.
 K/V heads are broadcast to match query heads count.
+
+Note: The default function body uses a Loop for element-wise modifier
+application, which is intended as a fallback. Optimized backends should
+recognize this pattern and apply fused kernel implementations.
 )DOC";
 
 // ---------------------------------------------------------------------------
