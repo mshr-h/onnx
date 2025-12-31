@@ -34,6 +34,9 @@ with optional user-provided customization subgraphs at up to three stages:
 2. mask_mod: Determine which (q_idx, k_idx) connections are allowed
 3. prob_mod: Modify each scalar probability after Softmax
 
+This operator mirrors the capabilities of PyTorch's flex_attention:
+https://docs.pytorch.org/docs/stable/nn.attention.flex_attention.html
+
 Input Shapes (MUST be rank-4 tensors):
 - Q: `(batch_size, q_num_heads, q_sequence_length, head_size)`
 - K: `(batch_size, kv_num_heads, kv_sequence_length, head_size)`

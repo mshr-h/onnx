@@ -32752,6 +32752,9 @@ This version of the operator has been available since version 26 of the default 
   2. mask_mod: Determine which (q_idx, k_idx) connections are allowed
   3. prob_mod: Modify each scalar probability after Softmax
 
+  This operator mirrors the capabilities of PyTorch's flex_attention:
+  https://docs.pytorch.org/docs/stable/nn.attention.flex_attention.html
+
   Input Shapes (MUST be rank-4 tensors):
   - Q: `(batch_size, q_num_heads, q_sequence_length, head_size)`
   - K: `(batch_size, kv_num_heads, kv_sequence_length, head_size)`
@@ -32773,6 +32776,10 @@ This version of the operator has been available since version 26 of the default 
   Grouped Query Attention (GQA):
   When `enable_gqa=1`, supports GQA where `q_num_heads` is a multiple of `kv_num_heads`.
   K/V heads are broadcast to match query heads count.
+
+  Note: The default function body uses a Loop for element-wise modifier
+  application, which is intended as a fallback. Optimized backends should
+  recognize this pattern and apply fused kernel implementations.
 
 #### Version
 
