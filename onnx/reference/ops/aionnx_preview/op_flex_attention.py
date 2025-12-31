@@ -162,7 +162,6 @@ class FlexAttention(OpRun):
         prob_mod: Any = None,
         **_: Any,
     ) -> tuple[np.ndarray]:
-
         return _compute_flex_attention(
             Q,
             K,
@@ -172,5 +171,5 @@ class FlexAttention(OpRun):
             mask_value=mask_value,
             score_mod=score_mod,
             mask_mod=mask_mod,
-            prob_mod=prob_mod
+            prob_mod=prob_mod,
         )

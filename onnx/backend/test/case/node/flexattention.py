@@ -36,14 +36,13 @@ def _make_score_mod_bias_graph(bias_value: float) -> onnx.GraphProto:
     # Node: score_out = score + bias
     add_node = helper.make_node("Add", ["score", "bias"], ["score_out"])
 
-    graph = helper.make_graph(
+    return helper.make_graph(
         [add_node],
         "score_mod_bias",
         [score_in, batch_in, head_in, q_idx_in, k_idx_in],
         [score_out],
         [bias_tensor],
     )
-    return graph
 
 
 def _make_causal_mask_mod_graph() -> onnx.GraphProto:
@@ -61,13 +60,12 @@ def _make_causal_mask_mod_graph() -> onnx.GraphProto:
     # Node: mask_out = q_idx >= k_idx
     ge_node = helper.make_node("GreaterOrEqual", ["q_idx", "k_idx"], ["mask_out"])
 
-    graph = helper.make_graph(
+    return helper.make_graph(
         [ge_node],
         "causal_mask_mod",
         [batch_in, head_in, q_idx_in, k_idx_in],
         [mask_out],
     )
-    return graph
 
 
 def _make_prob_mod_scale_graph(scale_value: float) -> onnx.GraphProto:
@@ -87,14 +85,13 @@ def _make_prob_mod_scale_graph(scale_value: float) -> onnx.GraphProto:
 
     mul_node = helper.make_node("Mul", ["prob", "scale"], ["prob_out"])
 
-    graph = helper.make_graph(
+    return helper.make_graph(
         [mul_node],
         "prob_mod_scale",
         [prob_in, batch_in, head_in, q_idx_in, k_idx_in],
         [prob_out],
         [scale_tensor],
     )
-    return graph
 
 
 class FlexAttention(Base):

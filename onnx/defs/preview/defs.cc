@@ -68,9 +68,7 @@ recognize this pattern and apply fused kernel implementations.
 // Forward Declarations
 // ---------------------------------------------------------------------------
 
-static void RemapGraphProtoNames(
-    GraphProto* g,
-    const std::function<std::string(const std::string&)>& map_name);
+static void RemapGraphProtoNames(GraphProto* g, const std::function<std::string(const std::string&)>& map_name);
 
 // ---------------------------------------------------------------------------
 // Graph Utilities
@@ -78,9 +76,7 @@ static void RemapGraphProtoNames(
 
 // Finds the last node index that produces any of the specified values.
 // Returns -1 if no producer is found.
-static int FindLastProducerIndex(
-    const FunctionProto& fp,
-    const std::vector<std::string>& values) {
+static int FindLastProducerIndex(const FunctionProto& fp, const std::vector<std::string>& values) {
   std::unordered_set<std::string> value_set(values.begin(), values.end());
   int last_index = -1;
   for (int i = 0; i < fp.node_size(); ++i) {
@@ -105,9 +101,7 @@ static void InsertNodeAt(FunctionProto& fp, const NodeProto& node, int index) {
 }
 
 // Remaps input/output names in a NodeProto using the provided mapping function.
-static void RemapNodeProtoNames(
-    NodeProto* node,
-    const std::function<std::string(const std::string&)>& map_name) {
+static void RemapNodeProtoNames(NodeProto* node, const std::function<std::string(const std::string&)>& map_name) {
   // Store and clear original inputs/outputs.
   const auto old_inputs = node->input();
   const auto old_outputs = node->output();
@@ -135,9 +129,7 @@ static void RemapNodeProtoNames(
 }
 
 // Remaps all value names in a GraphProto using the provided mapping function.
-static void RemapGraphProtoNames(
-    GraphProto* graph,
-    const std::function<std::string(const std::string&)>& map_name) {
+static void RemapGraphProtoNames(GraphProto* graph, const std::function<std::string(const std::string&)>& map_name) {
   // Remap graph I/O.
   for (int i = 0; i < graph->input_size(); ++i) {
     graph->mutable_input(i)->set_name(map_name(graph->input(i).name()));
@@ -235,16 +227,13 @@ static bool IsValidSoftmaxElementType(int32_t elem_type) {
 //   1. Use explicit softmax_precision attribute if provided
 //   2. Promote float16/bfloat16 to float32 for numerical stability
 //   3. Use input type as-is for float32/double
-static int32_t GetSoftmaxElementType(
-    int32_t input_elem_type,
-    const AttributeProto* softmax_precision_attr) {
+static int32_t GetSoftmaxElementType(int32_t input_elem_type, const AttributeProto* softmax_precision_attr) {
   // Honor explicit precision setting
   if (softmax_precision_attr != nullptr) {
     return static_cast<int32_t>(softmax_precision_attr->i());
   }
   // Auto-promote half-precision types to float32
-  if (input_elem_type == TensorProto::FLOAT16 ||
-      input_elem_type == TensorProto::BFLOAT16) {
+  if (input_elem_type == TensorProto::FLOAT16 || input_elem_type == TensorProto::BFLOAT16) {
     return TensorProto::FLOAT;
   }
   return input_elem_type;
@@ -256,31 +245,25 @@ static int32_t GetSoftmaxElementType(
 
 // Validates a modifier graph attribute for function builder context.
 // Returns true if the graph is valid or not provided.
-static bool ValidateModifierGraphForBuilder(
-    const AttributeProto* attr,
-    int expected_inputs) {
+static bool ValidateModifierGraphForBuilder(const AttributeProto* attr, int expected_inputs) {
   if (attr == nullptr) {
-    return true;  // Optional attribute not provided.
+    return true; // Optional attribute not provided.
   }
   if (!attr->has_g()) {
-    return false;  // Attribute exists but is not a graph.
+    return false; // Attribute exists but is not a graph.
   }
   const auto& graph = attr->g();
   return graph.input_size() == expected_inputs && graph.output_size() == 1;
 }
 
 // Checks if a modifier graph is a trivial identity (passes through first input unchanged).
-static bool IsIdentityModifierGraph(
-    const AttributeProto* attr,
-    int expected_inputs) {
+static bool IsIdentityModifierGraph(const AttributeProto* attr, int expected_inputs) {
   if (attr == nullptr || !attr->has_g()) {
     return false;
   }
   const auto& graph = attr->g();
-  return graph.node_size() == 0 &&
-         graph.input_size() == expected_inputs &&
-         graph.output_size() == 1 &&
-         graph.input(0).name() == graph.output(0).name();
+  return graph.node_size() == 0 && graph.input_size() == expected_inputs && graph.output_size() == 1 &&
+      graph.input(0).name() == graph.output(0).name();
 }
 
 // ---------------------------------------------------------------------------
@@ -288,12 +271,8 @@ static bool IsIdentityModifierGraph(
 // ---------------------------------------------------------------------------
 
 // Adds a binary operation node (e.g., Add, Mul, Div, Mod) to a graph.
-static void AddBinaryNode(
-    GraphProto* graph,
-    const char* op_type,
-    const char* lhs,
-    const char* rhs,
-    const char* output) {
+static void
+AddBinaryNode(GraphProto* graph, const char* op_type, const char* lhs, const char* rhs, const char* output) {
   auto* node = graph->add_node();
   node->set_op_type(op_type);
   node->add_input(lhs);
@@ -302,10 +281,7 @@ static void AddBinaryNode(
 }
 
 // Adds an Identity node to a graph.
-static void AddIdentityNode(
-    GraphProto* graph,
-    const char* input,
-    const char* output) {
+static void AddIdentityNode(GraphProto* graph, const char* input, const char* output) {
   auto* node = graph->add_node();
   node->set_op_type("Identity");
   node->add_input(input);
@@ -313,11 +289,7 @@ static void AddIdentityNode(
 }
 
 // Adds a Gather node with axis=0 to a graph.
-static void AddGatherNode(
-    GraphProto* graph,
-    const char* data,
-    const char* indices,
-    const char* output) {
+static void AddGatherNode(GraphProto* graph, const char* data, const char* indices, const char* output) {
   auto* node = graph->add_node();
   node->set_op_type("Gather");
   node->add_input(data);
@@ -345,10 +317,7 @@ static void AddLoopIndexDecompositionNodes(GraphProto* body) {
 
 // Creates a Loop node for the scalar-contract pattern.
 // Returns a pointer to the body GraphProto for further customization.
-static GraphProto* CreateScalarContractLoopNode(
-    NodeProto& loop_node,
-    const char* output_name,
-    const char* body_name) {
+static GraphProto* CreateScalarContractLoopNode(NodeProto& loop_node, const char* output_name, const char* body_name) {
   loop_node.Clear();
   loop_node.set_op_type("Loop");
   loop_node.add_input("N");
@@ -361,8 +330,8 @@ static GraphProto* CreateScalarContractLoopNode(
 
   GraphProto* body = body_attr->mutable_g();
   body->set_name(body_name);
-  body->add_input()->set_name("iter");      // INT64 scalar (loop counter)
-  body->add_input()->set_name("cond_in");   // BOOL scalar (continue condition)
+  body->add_input()->set_name("iter"); // INT64 scalar (loop counter)
+  body->add_input()->set_name("cond_in"); // BOOL scalar (continue condition)
   body->add_output()->set_name("cond_out"); // BOOL scalar (next condition)
   body->add_output()->set_name("scan_out"); // Output value to accumulate
 
@@ -370,9 +339,7 @@ static GraphProto* CreateScalarContractLoopNode(
 }
 
 // Finalizes a scalar-contract Loop body with termination nodes.
-static void FinalizeScalarContractLoopBody(
-    GraphProto* body,
-    const char* result_name) {
+static void FinalizeScalarContractLoopBody(GraphProto* body, const char* result_name) {
   AddIdentityNode(body, "cond_in", "cond_out");
   AddIdentityNode(body, result_name, "scan_out");
 }
@@ -402,35 +369,40 @@ static void ValidateModifierGraph(
   // Validate I/O counts.
   if (graph.input_size() != static_cast<int>(expected_inputs)) {
     fail_shape_inference(
-        "Attribute ", attr_name, " expected ", expected_inputs,
-        " inputs but graph has ", graph.input_size(), ".");
+        "Attribute ", attr_name, " expected ", expected_inputs, " inputs but graph has ", graph.input_size(), ".");
   }
   if (graph.output_size() != 1) {
-    fail_shape_inference(
-        "Attribute ", attr_name, " must have exactly one output.");
+    fail_shape_inference("Attribute ", attr_name, " must have exactly one output.");
   }
 
   // Helper: validate scalar tensor shape.
   auto validate_scalar = [&](const ValueInfoProto& vi, const char* desc) {
-    if (!vi.has_type()) return;
+    if (!vi.has_type())
+      return;
     if (!vi.type().has_tensor_type()) {
-      fail_shape_inference(
-          "Attribute ", attr_name, " ", desc, " must be a tensor.");
+      fail_shape_inference("Attribute ", attr_name, " ", desc, " must be a tensor.");
     }
     const auto& tensor = vi.type().tensor_type();
     if (tensor.has_shape() && tensor.shape().dim_size() != 0) {
-      fail_shape_inference(
-          "Attribute ", attr_name, " ", desc, " must be a scalar (0-D).");
+      fail_shape_inference("Attribute ", attr_name, " ", desc, " must be a scalar (0-D).");
     }
   };
 
   // Helper: validate element type.
   auto validate_dtype = [&](const ValueInfoProto& vi, int32_t expected, const char* desc) {
-    if (!vi.has_type() || !vi.type().has_tensor_type()) return;
+    if (!vi.has_type() || !vi.type().has_tensor_type())
+      return;
     if (vi.type().tensor_type().elem_type() != expected) {
       fail_shape_inference(
-          "Attribute ", attr_name, " ", desc, " type mismatch. Expected ",
-          expected, ", got ", vi.type().tensor_type().elem_type(), ".");
+          "Attribute ",
+          attr_name,
+          " ",
+          desc,
+          " type mismatch. Expected ",
+          expected,
+          ", got ",
+          vi.type().tensor_type().elem_type(),
+          ".");
     }
   };
 
@@ -467,11 +439,15 @@ static void ValidateModifierGraph(
       fail_shape_inference("Attribute ", attr_name, " output must be a tensor.");
     }
     const auto& tensor = type.tensor_type();
-    if (expected_output_elem_type.has_value() &&
-        tensor.elem_type() != expected_output_elem_type.value()) {
+    if (expected_output_elem_type.has_value() && tensor.elem_type() != expected_output_elem_type.value()) {
       fail_shape_inference(
-          "Attribute ", attr_name, " output type mismatch. Expected ",
-          expected_output_elem_type.value(), ", got ", tensor.elem_type(), ".");
+          "Attribute ",
+          attr_name,
+          " output type mismatch. Expected ",
+          expected_output_elem_type.value(),
+          ", got ",
+          tensor.elem_type(),
+          ".");
     }
     if (require_scalar_output && tensor.has_shape() && tensor.shape().dim_size() != 0) {
       fail_shape_inference("Attribute ", attr_name, " output must be scalar.");
@@ -557,10 +533,10 @@ static void FlexAttentionShapeInference(InferenceContext& ctx) {
   // Set output shape: (B, Hq, L, Dv).
   auto* output_shape = output_type->mutable_shape();
   output_shape->clear_dim();
-  *output_shape->add_dim() = q_shape.dim(0);  // Batch
-  *output_shape->add_dim() = q_shape.dim(1);  // Query heads
-  *output_shape->add_dim() = q_shape.dim(2);  // Query sequence length
-  *output_shape->add_dim() = v_shape.dim(3);  // Value head size
+  *output_shape->add_dim() = q_shape.dim(0); // Batch
+  *output_shape->add_dim() = q_shape.dim(1); // Query heads
+  *output_shape->add_dim() = q_shape.dim(2); // Query sequence length
+  *output_shape->add_dim() = v_shape.dim(3); // Value head size
 
   // Merge batch dimension info from all inputs.
   mergeInDimensionInfo(k_shape.dim(0), *output_shape->mutable_dim(0), 0);
@@ -570,23 +546,17 @@ static void FlexAttentionShapeInference(InferenceContext& ctx) {
   }
 
   // Validate softmax precision.
-  const int32_t softmax_elem_type =
-      GetSoftmaxElementType(q_elem_type, ctx.getAttribute("softmax_precision"));
+  const int32_t softmax_elem_type = GetSoftmaxElementType(q_elem_type, ctx.getAttribute("softmax_precision"));
   if (!IsValidSoftmaxElementType(softmax_elem_type)) {
-    fail_type_inference(
-        "softmax_precision must be specified when inputs are not float/float16/bfloat16/double.");
+    fail_type_inference("softmax_precision must be specified when inputs are not float/float16/bfloat16/double.");
   }
 
   // Validate modifier graphs.
   ValidateModifierGraph(
-      ctx, ctx.getAttribute("score_mod"), kScoreProbModInputCount,
-      "score_mod", softmax_elem_type, true);
+      ctx, ctx.getAttribute("score_mod"), kScoreProbModInputCount, "score_mod", softmax_elem_type, true);
+  ValidateModifierGraph(ctx, ctx.getAttribute("mask_mod"), kMaskModInputCount, "mask_mod", TensorProto::BOOL, true);
   ValidateModifierGraph(
-      ctx, ctx.getAttribute("mask_mod"), kMaskModInputCount,
-      "mask_mod", TensorProto::BOOL, true);
-  ValidateModifierGraph(
-      ctx, ctx.getAttribute("prob_mod"), kScoreProbModInputCount,
-      "prob_mod", softmax_elem_type, true);
+      ctx, ctx.getAttribute("prob_mod"), kScoreProbModInputCount, "prob_mod", softmax_elem_type, true);
 }
 
 // ---------------------------------------------------------------------------
@@ -625,22 +595,19 @@ static bool BuildFlexAttentionFunctionBody(
   const auto* k_type = ctx.getInputType(1);
   const auto* v_type = ctx.getInputType(2);
 
-  if (!q_type || !k_type || !v_type ||
-      !q_type->has_tensor_type() ||
-      !k_type->has_tensor_type() ||
+  if (!q_type || !k_type || !v_type || !q_type->has_tensor_type() || !k_type->has_tensor_type() ||
       !v_type->has_tensor_type()) {
     return false;
   }
 
   const int64_t input_elem_type = q_type->tensor_type().elem_type();
-  if (k_type->tensor_type().elem_type() != input_elem_type ||
-      v_type->tensor_type().elem_type() != input_elem_type) {
+  if (k_type->tensor_type().elem_type() != input_elem_type || v_type->tensor_type().elem_type() != input_elem_type) {
     return false;
   }
 
   // Determine softmax precision
-  const int32_t softmax_precision = GetSoftmaxElementType(
-      static_cast<int32_t>(input_elem_type), ctx.getAttribute("softmax_precision"));
+  const int32_t softmax_precision =
+      GetSoftmaxElementType(static_cast<int32_t>(input_elem_type), ctx.getAttribute("softmax_precision"));
   if (!IsValidSoftmaxElementType(softmax_precision)) {
     return false;
   }
@@ -654,9 +621,7 @@ static bool BuildFlexAttentionFunctionBody(
 
   // Use -infinity as default mask value (same pattern as Attention operator)
   const auto* mask_value_attr = ctx.getAttribute("mask_value");
-  const float mask_value = mask_value_attr
-      ? mask_value_attr->f()
-      : -std::numeric_limits<float>::infinity();
+  const float mask_value = mask_value_attr ? mask_value_attr->f() : -std::numeric_limits<float>::infinity();
 
   // Validate modifier graphs
   const auto* score_mod_attr = ctx.getAttribute("score_mod");
@@ -670,11 +635,9 @@ static bool BuildFlexAttentionFunctionBody(
   }
 
   // Check which modifier loops are needed.
-  const bool need_score_loop = score_mod_attr &&
-      !IsIdentityModifierGraph(score_mod_attr, kScoreProbModInputCount);
+  const bool need_score_loop = score_mod_attr && !IsIdentityModifierGraph(score_mod_attr, kScoreProbModInputCount);
   const bool need_mask_loop = (mask_mod_attr != nullptr);
-  const bool need_prob_loop = prob_mod_attr &&
-      !IsIdentityModifierGraph(prob_mod_attr, kScoreProbModInputCount);
+  const bool need_prob_loop = prob_mod_attr && !IsIdentityModifierGraph(prob_mod_attr, kScoreProbModInputCount);
 
   // Build the function graph
   constexpr int64_t kFloat32 = TensorProto_DataType_FLOAT;
@@ -713,8 +676,7 @@ static bool BuildFlexAttentionFunctionBody(
         .Add("VAlignedShape = Concat <axis = 0> (BatchSize, QNumHeads, KVSeqLen, VHeadSize1D)")
         .Add("VAligned = Reshape(VExpanded, VAlignedShape)");
   } else {
-    builder.Add("KAligned = Identity(KReshaped)")
-        .Add("VAligned = Identity(VReshaped)");
+    builder.Add("KAligned = Identity(KReshaped)").Add("VAligned = Identity(VReshaped)");
   }
 
   // Compute scaling factor.
@@ -727,8 +689,7 @@ static bool BuildFlexAttentionFunctionBody(
       .Const("OneF", ToTensor<float>(1.0f))
       .Add("CalculatedScale = Div(OneF, SqrtHeadSize)")
       .Const("ScaleF", ToTensor<float>(scale))
-      .Add(scale_attr != nullptr ? "ScaleFactorF32 = Identity(ScaleF)"
-                                 : "ScaleFactorF32 = Identity(CalculatedScale)");
+      .Add(scale_attr != nullptr ? "ScaleFactorF32 = Identity(ScaleF)" : "ScaleFactorF32 = Identity(CalculatedScale)");
 
   // Compute attention scores: (Q @ K^T) * scale.
   builder.Add("KTranspose = Transpose <perm = [0, 1, 3, 2]> (KAligned)")
@@ -757,8 +718,7 @@ static bool BuildFlexAttentionFunctionBody(
   // Apply score_mod.
   if (need_score_loop) {
     const auto& graph = score_mod_attr->g();
-    GraphProto* body = CreateScalarContractLoopNode(
-        score_loop_node, "ScoreModFlat", "FlexAttention_score_mod_body");
+    GraphProto* body = CreateScalarContractLoopNode(score_loop_node, "ScoreModFlat", "FlexAttention_score_mod_body");
 
     AddLoopIndexDecompositionNodes(body);
     AddGatherNode(body, "ScoreFlat", "iter", "score_i");
@@ -781,8 +741,7 @@ static bool BuildFlexAttentionFunctionBody(
   // Apply mask_mod.
   if (need_mask_loop) {
     const auto& graph = mask_mod_attr->g();
-    GraphProto* body = CreateScalarContractLoopNode(
-        mask_loop_node, "MaskFlat", "FlexAttention_mask_mod_body");
+    GraphProto* body = CreateScalarContractLoopNode(mask_loop_node, "MaskFlat", "FlexAttention_mask_mod_body");
 
     AddLoopIndexDecompositionNodes(body);
 
@@ -811,8 +770,7 @@ static bool BuildFlexAttentionFunctionBody(
     const auto& graph = prob_mod_attr->g();
     builder.Add("ProbFlat = Reshape(Prob, NegOne1D)");
 
-    GraphProto* body = CreateScalarContractLoopNode(
-        prob_loop_node, "ProbModFlat", "FlexAttention_prob_mod_body");
+    GraphProto* body = CreateScalarContractLoopNode(prob_loop_node, "ProbModFlat", "FlexAttention_prob_mod_body");
 
     AddLoopIndexDecompositionNodes(body);
     AddGatherNode(body, "ProbFlat", "iter", "prob_i");
@@ -844,8 +802,7 @@ static bool BuildFlexAttentionFunctionBody(
   // Finalize function and insert loop nodes.
   schema.BuildFunction(functionProto);
 
-  const std::vector<std::string> loop_deps = {
-      "ScoreFlat", "N", "CondInit", "B", "H", "L", "S"};
+  const std::vector<std::string> loop_deps = {"ScoreFlat", "N", "CondInit", "B", "H", "L", "S"};
 
   if (need_score_loop) {
     int pos = FindLastProducerIndex(functionProto, loop_deps) + 1;
@@ -856,8 +813,7 @@ static bool BuildFlexAttentionFunctionBody(
     InsertNodeAt(functionProto, mask_loop_node, std::max(0, pos));
   }
   if (need_prob_loop) {
-    std::vector<std::string> prob_deps = {
-        "ProbFlat", "N", "CondInit", "B", "H", "L", "S"};
+    std::vector<std::string> prob_deps = {"ProbFlat", "N", "CondInit", "B", "H", "L", "S"};
     int pos = FindLastProducerIndex(functionProto, prob_deps) + 1;
     InsertNodeAt(functionProto, prob_loop_node, std::max(0, pos));
   }
@@ -874,26 +830,10 @@ ONNX_PREVIEW_OPERATOR_SET_SCHEMA(
     1,
     OpSchema()
         .SetDoc(FlexAttention_ver1_doc)
-        .Input(
-            0,
-            "Q",
-            "Query tensor with shape `(batch_size, q_num_heads, q_seq_len, head_size)`.",
-            "T1")
-        .Input(
-            1,
-            "K",
-            "Key tensor with shape `(batch_size, kv_num_heads, kv_seq_len, head_size)`.",
-            "T1")
-        .Input(
-            2,
-            "V",
-            "Value tensor with shape `(batch_size, kv_num_heads, kv_seq_len, v_head_size)`.",
-            "T1")
-        .Output(
-            0,
-            "Y",
-            "Output tensor with shape `(batch_size, q_num_heads, q_seq_len, v_head_size)`.",
-            "T1")
+        .Input(0, "Q", "Query tensor with shape `(batch_size, q_num_heads, q_seq_len, head_size)`.", "T1")
+        .Input(1, "K", "Key tensor with shape `(batch_size, kv_num_heads, kv_seq_len, head_size)`.", "T1")
+        .Input(2, "V", "Value tensor with shape `(batch_size, kv_num_heads, kv_seq_len, v_head_size)`.", "T1")
+        .Output(0, "Y", "Output tensor with shape `(batch_size, q_num_heads, q_seq_len, v_head_size)`.", "T1")
         .Attr(
             "scale",
             "Scaling factor for Q*K^T. Defaults to 1/sqrt(head_size).",
@@ -939,13 +879,10 @@ ONNX_PREVIEW_OPERATOR_SET_SCHEMA(
             "prob uses softmax_precision type; indices are INT64.",
             AttributeProto::GRAPH,
             OPTIONAL_VALUE)
-        .TypeConstraint(
-            "T1",
-            OpSchema::all_float_types_ir4(),
-            "Constrain Q, K, V to float tensors.")
+        .TypeConstraint("T1", OpSchema::all_float_types_ir4(), "Constrain Q, K, V to float tensors.")
         .TypeAndShapeInferenceFunction(FlexAttentionShapeInference)
         .SetSupportLevel(OpSchema::SupportType::EXPERIMENTAL)
         .SetNodeDeterminism(OpSchema::NodeDeterminism::Deterministic)
         .SetContextDependentFunctionBodyBuilder(BuildFlexAttentionFunctionBody));
 
-}  // namespace ONNX_NAMESPACE
+} // namespace ONNX_NAMESPACE
