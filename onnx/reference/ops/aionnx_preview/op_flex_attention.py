@@ -1,3 +1,6 @@
+# Copyright (c) ONNX Project Contributors
+#
+# SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
@@ -43,16 +46,20 @@ def _compute_flex_attention(
     Q: np.ndarray,
     K: np.ndarray,
     V: np.ndarray,
-    scale: float = 1.0,
+    scale: float | None = None,
     enable_gqa: int | None = None,
-    mask_value: float = -3.402823466e+38,
+    mask_value: float = -np.inf,
     score_mod: Any = None,
     mask_mod: Any = None,
     prob_mod: Any = None,
 ) -> tuple[np.ndarray,]:
-    assert len(Q.shape) == len(K.shape) == len(V.shape)
+    assert len(Q.shape) == len(K.shape) == len(V.shape) == 4
 
     B, Hq, L, E = Q.shape
+
+    # Calculate scaling factor if not provided (default: 1/sqrt(head_size))
+    if scale is None:
+        scale = 1.0 / np.sqrt(E)
     _Bk, Hkv, S, _Ek = K.shape
     _Bv, _Hkv2, _Sv, Ev = V.shape
     # Compute in float32 for stability/portability.
@@ -132,8 +139,6 @@ def _compute_flex_attention(
                         p = float(np.asarray(p_out, dtype=np.float32).reshape(()))
                         probs2[kv_idx] = np.float32(p)
                     probs = probs2
-                    # NOTE: Spec案どおり「自動再正規化はしない」
-                    # 必要なら prob_mod 側で実装する。
 
                 # Y = probs @ V
                 out[b, hq, q_idx, :] = probs @ V_mat  # (Ev,)
@@ -149,9 +154,9 @@ class FlexAttention(OpRun):
         Q: np.ndarray,
         K: np.ndarray,
         V: np.ndarray,
-        scale: float = 1.0,
+        scale: float | None = None,
         enable_gqa: int | None = None,
-        mask_value: float = -3.402823466e+38,
+        mask_value: float = -np.inf,
         score_mod: Any = None,
         mask_mod: Any = None,
         prob_mod: Any = None,
